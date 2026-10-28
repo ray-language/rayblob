@@ -1,0 +1,141 @@
+//! rayblob: an S3-compatible object store.
+
+import std/crypto;
+import std/hex;
+import std/net;
+import std/time;
+import std/url;
+import config;
+import server;
+import sigv4;
+
+const VERSION: string = "0.1.0";
+
+fn usage() -> string {
+    `rayblob ${VERSION} — an S3-compatible object store
+
+usage:
+  rayblob serve [--config rayblob.toml]
+  rayblob presign [--config rayblob.toml] [--key NAME] [--method GET|PUT] [--expires SECONDS] [--host HOST:PORT] BUCKET/KEY
+  rayblob keygen NAME          print a [key.NAME] table with fresh credentials
+`
+}
+
+fn flag(argv: [string], name: string, default: string) -> string {
+    for i in 0..argv.len() {
+        if (argv[i] == name && i + 1 < argv.len()) {
+            return argv[i + 1];
+        }
+    }
+    default
+}
+
+// The arguments that are neither flags nor flag values.
+fn positional(argv: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        if (argv[i].starts_with("--")) {
+            i = i + 2;
+        } else {
+            out.push(argv[i]);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+fn load(argv: [string]) -> Result<config.Config, string> {
+    let path = flag(argv, "--config", "rayblob.toml");
+    config.load(path).map_err(fn(e: string) -> string { "${path}: ${e}" })
+}
+
+fn serve(argv: [string]) -> Result<int, string> {
+    let cfg = load(argv)?;
+    if (cfg.keys.len() == 0) {
+        return Result.Err(
+            "no [key.NAME] in the config: run `rayblob keygen admin` and paste it in"
+        );
+    }
+    let l = server.listen(cfg)?;
+    print(
+        "rayblob ${VERSION}: http://${cfg.host}:${net.local_port(l)}, data in ${cfg.data}, region ${cfg.region}, ${cfg.keys.len()} key(s), objects up to ${cfg.max_object / 1048576} MiB per request"
+    );
+    let never: Channel<int> = Channel.bounded(1);
+    server.serve(cfg, l, never, false)
+}
+
+fn presign(argv: [string]) -> Result<int, string> {
+    let cfg = load(argv)?;
+    let pos = positional(argv.slice(1, argv.len()));
+    if (pos.len() != 1 || !pos[0].contains("/")) {
+        return Result.Err("presign needs BUCKET/KEY");
+    }
+    let name = flag(argv, "--key", "");
+    var key: Option<config.Key> = Option.None;
+    for k in cfg.keys {
+        if (name == "" || k.name == name) {
+            key = Option.Some(k);
+            break;
+        }
+    }
+    let k = match (key) {
+        Option.Some(k) => k,
+        Option.None => return Result.Err("no key named '${name}' in the config"),
+    };
+    let method = flag(argv, "--method", "GET").to_upper();
+    let expires = match (parse_int(flag(argv, "--expires", "900"))) {
+        Option.Some(n) => n,
+        Option.None => return Result.Err("--expires takes seconds"),
+    };
+    let host = flag(argv, "--host", "${cfg.host}:${cfg.port}");
+    let path = "/" + sigv4.encode_path(pos[0]);
+    let signed = sigv4.presign(
+        k.access,
+        k.secret,
+        cfg.region,
+        method,
+        host,
+        path,
+        time.now(),
+        expires
+    );
+    print("http://${host}${signed}");
+    Result.Ok(0)
+}
+
+fn keygen(argv: [string]) -> Result<int, string> {
+    let pos = positional(argv.slice(1, argv.len()));
+    let name = if (pos.len() > 0) { pos[0] } else { "admin" };
+    let access = "AKRB" + hex.hex_encode(crypto.random_bytes(8)).to_upper();
+    let secret = url.url_encode(hex.hex_encode(crypto.random_bytes(20)));
+    print(
+        "[key.${name}]\naccess = \"${access}\"\nsecret = \"${secret}\"\nbuckets = [\"*\"]\nwrite = true"
+    );
+    Result.Ok(0)
+}
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 0 || argv[0] == "--help" || argv[0] == "-h") {
+        print(usage());
+        return if (argv.len() == 0) { 2 } else { 0 };
+    }
+    let r = match (argv[0]) {
+        "serve" => serve(argv),
+        "presign" => presign(argv),
+        "keygen" => keygen(argv),
+        "--version" => {
+            print(VERSION);
+            Result.Ok(0)
+        },
+        other => Result.Err("unknown command '${other}'\n\n${usage()}"),
+    };
+    match (r) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint("rayblob: ${e}");
+            1
+        },
+    }
+}

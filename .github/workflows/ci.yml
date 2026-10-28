@@ -1,0 +1,70 @@
+# rayblob CI: every pull request and every push to master checks the formatting and runs the
+# test suite on the VM and as native binaries, with the raylang release pinned in ray.toml
+# (.github/actions/setup-ray).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same PR supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: ray fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust and the pinned raylang
+        uses: ./.github/actions/setup-ray
+        with:
+          target: x86_64-unknown-linux-gnu
+      # `ray fmt` prints the canonical version: any difference is an unformatted file.
+      - name: Check that every source is formatted
+        shell: bash
+        run: |
+          status=0
+          for f in src/*.ray tests/*.ray; do
+            if ! ray fmt "$f" | diff -u "$f" - >/dev/null; then
+              echo "::error file=$f::not formatted (run: ray fmt -w $f)"
+              status=1
+            fi
+          done
+          exit $status
+
+  test:
+    name: test ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust and the pinned raylang
+        uses: ./.github/actions/setup-ray
+        with:
+          target: ${{ matrix.target }}
+      - name: Fetch the dependencies
+        run: ray fetch
+      - name: Tests (VM)
+        shell: bash
+        run: ray test
+      # Two native-only build failures turned up while writing rayblob (findings #280, #281).
+      - name: Tests (native)
+        shell: bash
+        run: ray test --native

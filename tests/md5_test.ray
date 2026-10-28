@@ -1,0 +1,44 @@
+// The RFC 1321 test suite, the same digest fed in odd pieces, and agreement with std/crypto/md5.
+
+import std/crypto/md5 as stdmd5;
+import std/hex;
+import md5;
+
+@test
+fn rfc_1321_suite() {
+    assert_eq(md5.hex_of("".to_bytes()), "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq(md5.hex_of("a".to_bytes()), "0cc175b9c0f1b6a831c399e269772661");
+    assert_eq(md5.hex_of("abc".to_bytes()), "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq(md5.hex_of("message digest".to_bytes()), "f96b697d7cb7938d525a2f31aaf161d0");
+    assert_eq(
+        md5.hex_of("abcdefghijklmnopqrstuvwxyz".to_bytes()),
+        "c3fcd3d76192e4007dfb496cca67e13b"
+    );
+    assert_eq(
+        md5.hex_of(
+            "12345678901234567890123456789012345678901234567890123456789012345678901234567890".to_bytes()
+        ),
+        "57edf4a22be3c955ac49da2e2107b67a"
+    );
+}
+
+@test
+fn pieces_and_the_stdlib_agree() {
+    var xs: [int] = [];
+    for i in 0..10000 {
+        xs.push((i * 7 + 3) % 256);
+    }
+    let data = bytes_of(xs);
+    let want = hex.hex_encode(stdmd5.md5(data));
+    assert_eq(md5.hex_of(data), want);
+    for step in [1, 13, 63, 64, 65, 999] {
+        let h = md5.new();
+        var pos = 0;
+        while (pos < data.len()) {
+            let end = if (pos + step > data.len()) { data.len() } else { pos + step };
+            md5.update(h, data.sub_bytes(pos, end));
+            pos = end;
+        }
+        assert_eq(hex.hex_encode(md5.finish(h)), want);
+    }
+}

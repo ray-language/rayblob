@@ -1,0 +1,341 @@
+//! AWS Signature Version 4 as a server checks it: parse what the client signed (the
+//! `Authorization` header or the `X-Amz-*` query of a presigned URL), rebuild the canonical
+//! request from the request as it arrived, and compare signatures. Also signs, for `presign`
+//! and the tests.
+
+import std/crypto;
+import std/hex;
+import std/time;
+import std/url;
+
+pub const ALGORITHM: string = "AWS4-HMAC-SHA256";
+
+pub const UNSIGNED: string = "UNSIGNED-PAYLOAD";
+
+/// What the client claims it signed.
+pub struct Claim {
+    access_key: string,
+    /// `YYYYMMDDTHHMMSSZ`, from `x-amz-date` (or `X-Amz-Date` in the query).
+    amz_date: string,
+    /// The scope: date, region and service the signature is bound to.
+    scope_date: string,
+    region: string,
+    service: string,
+    signed_headers: [string],
+    signature: string,
+    presigned: bool,
+    /// Seconds a presigned URL stays valid (0 for a header signature).
+    expires_s: int,
+}
+
+/// Parses `AWS4-HMAC-SHA256 Credential=AK/20130524/us-east-1/s3/aws4_request,
+/// SignedHeaders=host;range, Signature=hex`.
+pub fn parse_header(value: string, amz_date: string) -> Result<Claim, string> {
+    let rest = match (value.strip_prefix(ALGORITHM + " ")) {
+        Option.Some(r) => r,
+        Option.None => return Result.Err("unsupported authorization scheme"),
+    };
+    var credential = "";
+    var signed = "";
+    var signature = "";
+    for part in rest.split(",") {
+        let p = part.trim();
+        match (p.index_of("=")) {
+            Option.Some(eq) => {
+                let k = p.substring(0, eq);
+                let v = p.substring(eq + 1, p.len());
+                if (k == "Credential") {
+                    credential = v;
+                } else if (k == "SignedHeaders") {
+                    signed = v;
+                } else if (k == "Signature") {
+                    signature = v;
+                }
+            },
+            Option.None => return Result.Err("malformed authorization header"),
+        }
+    }
+    claim_of(credential, signed, signature, amz_date, false, 0)
+}
+
+/// Parses the `X-Amz-*` parameters of a presigned URL (already decoded).
+pub fn parse_query(q: Map<string, string>) -> Result<Claim, string> {
+    if (q.get_or("X-Amz-Algorithm", "") != ALGORITHM) {
+        return Result.Err("unsupported X-Amz-Algorithm");
+    }
+    let expires = match (parse_int(q.get_or("X-Amz-Expires", ""))) {
+        Option.Some(n) => n,
+        Option.None => return Result.Err("missing X-Amz-Expires"),
+    };
+    if (expires < 1 || expires > 604800) {
+        return Result.Err("X-Amz-Expires must be between 1 and 604800 seconds");
+    }
+    claim_of(
+        q.get_or("X-Amz-Credential", ""),
+        q.get_or("X-Amz-SignedHeaders", ""),
+        q.get_or("X-Amz-Signature", ""),
+        q.get_or("X-Amz-Date", ""),
+        true,
+        expires
+    )
+}
+
+fn claim_of(
+    credential: string,
+    signed: string,
+    signature: string,
+    amz_date: string,
+    presigned: bool,
+    expires_s: int
+) -> Result<Claim, string> {
+    let c = credential.split("/");
+    if (c.len() != 5 || c[4] != "aws4_request") {
+        return Result.Err("malformed credential scope");
+    }
+    if (signed == "" || signature.len() != 64) {
+        return Result.Err("missing signed headers or signature");
+    }
+    if (amz_date.len() != 16 || amz_date.substring(0, 8) != c[1]) {
+        return Result.Err("the date does not match the credential scope");
+    }
+    Result.Ok(
+        Claim {
+            access_key: c[0],
+            amz_date: amz_date,
+            scope_date: c[1],
+            region: c[2],
+            service: c[3],
+            signed_headers: signed.split(";"),
+            signature: signature.to_lower(),
+            presigned: presigned,
+            expires_s: expires_s
+        }
+    )
+}
+
+/// The canonical query string: every pair decoded, re-encoded the AWS way (RFC 3986
+/// unreserved characters pass, the rest is `%XX`), and sorted by key and then value. The
+/// signature of a presigned URL is not part of what it signs.
+pub fn canonical_query(raw: string) -> string {
+    if (raw == "") {
+        return "";
+    }
+    var pairs: [(string, string)] = [];
+    for p in raw.split("&") {
+        if (p == "") {
+            continue;
+        }
+        let (k, v) = match (p.index_of("=")) {
+            Option.Some(eq) => (p.substring(0, eq), p.substring(eq + 1, p.len())),
+            Option.None => (p, ""),
+        };
+        let dk = url_encode_aws(decode(k));
+        if (dk == "X-Amz-Signature") {
+            continue;
+        }
+        pairs.push((dk, url_encode_aws(decode(v))));
+    }
+    let sorted = sort_by(pairs, fn(a: (string, string), b: (string, string)) -> bool {
+        let (ak, av) = a;
+        let (bk, bv) = b;
+        ak < bk || (ak == bk && av < bv)
+    });
+    join(sorted.map(fn(p: (string, string)) -> string {
+        let (k, v) = p;
+        "${k}=${v}"
+    }), "&")
+}
+
+fn decode(s: string) -> string {
+    url.percent_decode(s).unwrap_or(s)
+}
+
+fn url_encode_aws(s: string) -> string {
+    url.url_encode(s)
+}
+
+/// Canonical headers block and the signed-headers line, in the order the client listed them
+/// (SigV4 requires them sorted; a client that did not sort them gets a mismatch, as on AWS).
+fn canonical_headers(headers: Map<string, string>, signed: [string]) -> string {
+    var out = "";
+    for name in signed {
+        out = out + name + ":" + collapse(headers.get_or(name, "")) + "\n";
+    }
+    out
+}
+
+// Trims and squeezes runs of spaces into one, as SigV4 asks.
+fn collapse(v: string) -> string {
+    let t = v.trim();
+    if (!t.contains("  ")) {
+        return t;
+    }
+    var out = "";
+    var space = false;
+    for c in t.chars() {
+        if (c == ' ') {
+            if (!space) {
+                out = out + " ";
+            }
+            space = true;
+        } else {
+            out = out + to_string(c);
+            space = false;
+        }
+    }
+    out
+}
+
+/// The canonical request. `raw_path` is the path as the client sent it (S3 does not
+/// normalize or re-encode it); `payload_hash` is the hex SHA-256 the client declared, or
+/// `UNSIGNED-PAYLOAD`.
+pub fn canonical_request(
+    method: string,
+    raw_path: string,
+    raw_query: string,
+    headers: Map<string, string>,
+    signed: [string],
+    payload_hash: string
+) -> string {
+    let path = if (raw_path == "") { "/" } else { raw_path };
+    method
+        + "\n"
+        + path
+        + "\n"
+        + canonical_query(raw_query)
+        + "\n"
+        + canonical_headers(headers, signed)
+        + "\n"
+        + join(signed, ";")
+        + "\n"
+        + payload_hash
+}
+
+/// The signing key for one day, region and service: the HMAC chain from `AWS4<secret>`.
+pub fn signing_key(secret: string, date: string, region: string, service: string) -> bytes {
+    let k_date = crypto.hmac_sha256(("AWS4" + secret).to_bytes(), date.to_bytes());
+    let k_region = crypto.hmac_sha256(k_date, region.to_bytes());
+    let k_service = crypto.hmac_sha256(k_region, service.to_bytes());
+    crypto.hmac_sha256(k_service, "aws4_request".to_bytes())
+}
+
+pub fn scope(date: string, region: string, service: string) -> string {
+    "${date}/${region}/${service}/aws4_request"
+}
+
+pub fn string_to_sign(amz_date: string, scope: string, canonical: string) -> string {
+    ALGORITHM + "\n" + amz_date + "\n" + scope + "\n" + sha256_hex(canonical.to_bytes())
+}
+
+/// The hex signature of a canonical request.
+pub fn sign(
+    secret: string,
+    amz_date: string,
+    region: string,
+    service: string,
+    canonical: string
+) -> string {
+    let date = amz_date.substring(0, 8);
+    let key = signing_key(secret, date, region, service);
+    let sts = string_to_sign(amz_date, scope(date, region, service), canonical);
+    hex.hex_encode(crypto.hmac_sha256(key, sts.to_bytes()))
+}
+
+/// Checks a claim against the request: the signature matches (in constant time), and for a
+/// presigned URL it has not expired. `now_ms` is the server clock.
+pub fn verify(
+    claim: Claim,
+    secret: string,
+    method: string,
+    raw_path: string,
+    raw_query: string,
+    headers: Map<string, string>,
+    payload_hash: string,
+    now_ms: int
+) -> Result<int, string> {
+    let signed_at = match (parse_amz_date(claim.amz_date)) {
+        Result.Ok(ms) => ms,
+        Result.Err(e) => return Result.Err(e),
+    };
+    if (claim.presigned) {
+        if (now_ms > signed_at + claim.expires_s * 1000) {
+            return Result.Err("expired");
+        }
+        if (signed_at > now_ms + 15 * 60 * 1000) {
+            return Result.Err("signed in the future");
+        }
+    } else if (now_ms - signed_at > 15 * 60 * 1000 || signed_at - now_ms > 15 * 60 * 1000) {
+        return Result.Err("skewed");
+    }
+    let canonical = canonical_request(
+        method,
+        raw_path,
+        raw_query,
+        headers,
+        claim.signed_headers,
+        payload_hash
+    );
+    let want = sign(secret, claim.amz_date, claim.region, claim.service, canonical);
+    if (crypto.constant_time_eq(want.to_bytes(), claim.signature.to_bytes())) {
+        Result.Ok(0)
+    } else {
+        Result.Err("mismatch")
+    }
+}
+
+/// `20130524T000000Z` → milliseconds since the epoch.
+pub fn parse_amz_date(s: string) -> Result<int, string> {
+    if (s.len() != 16 || s[8] != 'T' || s[15] != 'Z') {
+        return Result.Err("malformed x-amz-date");
+    }
+    let iso = s.substring(0, 4)
+        + "-"
+        + s.substring(4, 6)
+        + "-"
+        + s.substring(6, 8)
+        + "T"
+        + s.substring(9, 11)
+        + ":"
+        + s.substring(11, 13)
+        + ":"
+        + s.substring(13, 15)
+        + "Z";
+    time.parse_iso8601_millis(iso)
+}
+
+pub fn amz_date(ms: int) -> string {
+    time.to_iso8601_basic(time.from_epoch_millis(ms))
+}
+
+pub fn sha256_hex(b: bytes) -> string {
+    hex.hex_encode(crypto.sha256(b))
+}
+
+/// A presigned URL for `method` on `base` + `path` (path already encoded the AWS way), valid
+/// `expires_s` seconds from `now_ms`.
+pub fn presign(
+    access: string,
+    secret: string,
+    region: string,
+    method: string,
+    host: string,
+    path: string,
+    now_ms: int,
+    expires_s: int
+) -> string {
+    let date = amz_date(now_ms);
+    let cred = access + "/" + scope(date.substring(0, 8), region, "s3");
+    let query = "X-Amz-Algorithm=${ALGORITHM}&X-Amz-Credential=${url_encode_aws(cred)}"
+        + "&X-Amz-Date=${date}&X-Amz-Expires=${expires_s}&X-Amz-SignedHeaders=host";
+    let headers: Map<string, string> = Map.new();
+    headers.insert("host", host);
+    let canonical = canonical_request(method, path, query, headers, ["host"], UNSIGNED);
+    let sig = sign(secret, date, region, "s3", canonical);
+    "${path}?${query}&X-Amz-Signature=${sig}"
+}
+
+/// Encodes an object key for a URL path the way AWS clients do: every octet but the
+/// unreserved ones and `/` becomes `%XX`.
+pub fn encode_path(key: string) -> string {
+    join(key.split("/").map(url_encode_aws), "/")
+}

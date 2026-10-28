@@ -1,0 +1,1134 @@
+//! The S3 API, path style (`/bucket/key`): who is asking (SigV4 header, presigned URL or
+//! nobody), what they ask for, and the XML S3 clients expect back.
+
+import std/base64;
+import std/crypto;
+import std/hex;
+import std/time;
+import std/url;
+import std/uuid;
+import std/xml;
+import net/webserver;
+import blobs;
+import config;
+import index;
+import md5;
+import sigv4;
+
+const NS: string = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+const MAX_PARTS: int = 10000;
+
+pub struct Ctx {
+    cfg: config.Config,
+    ix: Channel<index.Msg>,
+}
+
+/// An S3 error: its code (`NoSuchKey`) and a sentence for people.
+pub struct Fail {
+    code: string,
+    message: string,
+}
+
+fn fail<T>(code: string, message: string) -> Result<T, Fail> {
+    Result.Err(Fail { code: code, message: message })
+}
+
+pub enum Who {
+    Anonymous,
+    Signed(config.Key, Signing),
+}
+
+/// What a signed request carries forward to check an `aws-chunked` body chunk by chunk.
+pub struct Signing {
+    key: bytes,
+    amz_date: string,
+    scope: string,
+    seed: string,
+}
+
+pub fn status_of(code: string) -> int {
+    match (code) {
+        "NoSuchBucket" => 404,
+        "NoSuchKey" => 404,
+        "NoSuchUpload" => 404,
+        "BucketAlreadyOwnedByYou" => 409,
+        "BucketAlreadyExists" => 409,
+        "BucketNotEmpty" => 409,
+        "AccessDenied" => 403,
+        "SignatureDoesNotMatch" => 403,
+        "InvalidAccessKeyId" => 403,
+        "RequestTimeTooSkewed" => 403,
+        "PreconditionFailed" => 412,
+        "InvalidRange" => 416,
+        "MethodNotAllowed" => 405,
+        "NotImplemented" => 501,
+        "InternalError" => 500,
+        _ => 400,
+    }
+}
+
+fn request_id() -> string {
+    uuid.uuid_v4().replace("-", "").substring(0, 16).to_upper()
+}
+
+pub fn handle(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    let rid = request_id();
+    let r = match (route(ctx, req)) {
+        Result.Ok(r) => r,
+        Result.Err(f) => error_response(f, req.raw_path, rid),
+    };
+    r.headers.insert("x-amz-request-id", rid);
+    r.headers.insert("Server", "rayblob");
+    r
+}
+
+fn error_response(f: Fail, resource: string, rid: string) -> webserver.Response {
+    let e = xml.element("Error")
+        .with_child(text_el("Code", f.code))
+        .with_child(text_el("Message", f.message))
+        .with_child(text_el("Resource", resource))
+        .with_child(text_el("RequestId", rid));
+    xml_response(status_of(f.code), e)
+}
+
+fn text_el(name: string, value: string) -> xml.Elem {
+    xml.element(name).with_text(value)
+}
+
+fn xml_response(status: int, e: xml.Elem) -> webserver.Response {
+    let r = webserver.bytes_response(status, xml.serialize_doc(e).to_bytes());
+    r.headers.insert("Content-Type", "application/xml");
+    r
+}
+
+fn empty(status: int) -> webserver.Response {
+    webserver.bytes_response(status, bytes_of([]))
+}
+
+fn root_el(name: string) -> xml.Elem {
+    xml.element(name).with_attr("xmlns", NS)
+}
+
+// --- Routing ---
+
+fn route(ctx: Ctx, req: webserver.Request) -> Result<webserver.Response, Fail> {
+    let q = url.parse_query(req.query);
+    let who = authenticate(ctx, req, q)?;
+    let raw = req.raw_path.strip_prefix("/").unwrap_or(req.raw_path);
+    let (bucket, key) = match (raw.index_of("/")) {
+        Option.Some(i) => (decode(raw.substring(0, i))?, decode(raw.substring(i + 1, raw.len()))?),
+        Option.None => (decode(raw)?, ""),
+    };
+    if (bucket == "") {
+        return match (req.method) {
+            "GET" => list_buckets(ctx, who),
+            _ => fail("MethodNotAllowed", "only GET on the service"),
+        };
+    }
+    if (key == "") {
+        return bucket_op(ctx, req, q, who, bucket);
+    }
+    object_op(ctx, req, q, who, bucket, key)
+}
+
+fn decode(s: string) -> Result<string, Fail> {
+    match (url.percent_decode(s)) {
+        Result.Ok(d) => Result.Ok(d),
+        Result.Err(_) => fail("InvalidURI", "bad percent-encoding in the path"),
+    }
+}
+
+fn bucket_op(
+    ctx: Ctx,
+    req: webserver.Request,
+    q: Map<string, string>,
+    who: Who,
+    bucket: string
+) -> Result<webserver.Response, Fail> {
+    match (req.method) {
+        "PUT" => create_bucket(ctx, who, bucket),
+        "DELETE" => {
+            may_write(who, bucket)?;
+            index.ask_delete_bucket(ctx.ix, bucket).map_err(no_such)?;
+            Result.Ok(empty(204))
+        },
+        "HEAD" => {
+            may_read(who, bucket)?;
+            exists(ctx, bucket)?;
+            Result.Ok(empty(200))
+        },
+        "GET" => {
+            may_read(who, bucket)?;
+            if (q.contains_key("location")) {
+                exists(ctx, bucket)?;
+                return Result.Ok(
+                    xml_response(200, root_el("LocationConstraint").with_text(ctx.cfg.region))
+                );
+            }
+            if (q.contains_key("versioning")) {
+                exists(ctx, bucket)?;
+                return Result.Ok(xml_response(200, root_el("VersioningConfiguration")));
+            }
+            if (q.contains_key("uploads")) {
+                return fail("NotImplemented", "ListMultipartUploads is not implemented");
+            }
+            list_objects(ctx, q, bucket)
+        },
+        "POST" => {
+            if (q.contains_key("delete")) {
+                may_write(who, bucket)?;
+                return delete_objects(ctx, req, who, bucket);
+            }
+            fail("NotImplemented", "unsupported POST on a bucket")
+        },
+        _ => fail("MethodNotAllowed", "unsupported method on a bucket"),
+    }
+}
+
+fn object_op(
+    ctx: Ctx,
+    req: webserver.Request,
+    q: Map<string, string>,
+    who: Who,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    match (req.method) {
+        "GET" => if (q.contains_key("acl")) {
+            get_acl(ctx, who, bucket, key)
+        } else if (q.contains_key("uploadId")) {
+            may_write(who, bucket)?;
+            list_parts(ctx, q.get_or("uploadId", ""), bucket, key)
+        } else {
+            get_object(ctx, req, q, who, bucket, key)
+        },
+        "HEAD" => get_object(ctx, req, q, who, bucket, key),
+        "PUT" => {
+            may_write(who, bucket)?;
+            if (q.contains_key("acl")) {
+                let acl = acl_of(req)?;
+                index.ask_set_acl(ctx.ix, bucket, key, acl).map_err(no_such)?;
+                return Result.Ok(empty(200));
+            }
+            if (q.contains_key("uploadId")) {
+                return upload_part(ctx, req, q, who, bucket, key);
+            }
+            if (req.headers.contains_key("x-amz-copy-source")) {
+                return copy_object(ctx, req, who, bucket, key);
+            }
+            put_object(ctx, req, who, bucket, key)
+        },
+        "DELETE" => {
+            may_write(who, bucket)?;
+            if (q.contains_key("uploadId")) {
+                let freed = index.ask_abort(ctx.ix, q.get_or("uploadId", "")).map_err(no_such)?;
+                free(ctx, freed);
+                return Result.Ok(empty(204));
+            }
+            free(ctx, index.ask_delete(ctx.ix, bucket, key).map_err(no_such)?);
+            Result.Ok(empty(204))
+        },
+        "POST" => {
+            may_write(who, bucket)?;
+            if (q.contains_key("uploads")) {
+                return create_upload(ctx, req, bucket, key);
+            }
+            if (q.contains_key("uploadId")) {
+                return complete_upload(ctx, req, who, q.get_or("uploadId", ""), bucket, key);
+            }
+            fail("NotImplemented", "unsupported POST on an object")
+        },
+        _ => fail("MethodNotAllowed", "unsupported method on an object"),
+    }
+}
+
+// The index answers with S3 error codes; turn one into a Fail.
+fn no_such(code: string) -> Fail {
+    let msg = match (code) {
+        "NoSuchBucket" => "The specified bucket does not exist",
+        "NoSuchKey" => "The specified key does not exist.",
+        "NoSuchUpload" => "The specified multipart upload does not exist.",
+        "BucketNotEmpty" => "The bucket you tried to delete is not empty",
+        "BucketAlreadyOwnedByYou" => "Your previous request to create the named bucket succeeded and you already own it.",
+        _ => code,
+    };
+    let c = if (status_of(code) == 400 && !code.starts_with("Invalid")) {
+        "InternalError"
+    } else {
+        code
+    };
+    Fail { code: c, message: msg }
+}
+
+fn exists(ctx: Ctx, bucket: string) -> Result<int, Fail> {
+    if (index.ask_has_bucket(ctx.ix, bucket)) {
+        Result.Ok(0)
+    } else {
+        Result.Err(no_such("NoSuchBucket"))
+    }
+}
+
+fn free(ctx: Ctx, freed: index.Freed) {
+    for id in freed {
+        blobs.remove(ctx.cfg.data, id);
+    }
+}
+
+// --- Authentication and permissions ---
+
+fn authenticate(ctx: Ctx, req: webserver.Request, q: Map<string, string>) -> Result<Who, Fail> {
+    let auth = req.headers.get_or("authorization", "");
+    let presigned = q.contains_key("X-Amz-Signature");
+    if (auth == "" && !presigned) {
+        return Result.Ok(Who.Anonymous);
+    }
+    let parsed = if (presigned) {
+        sigv4.parse_query(q)
+    } else {
+        sigv4.parse_header(auth, req.headers.get_or("x-amz-date", ""))
+    };
+    let claim = match (parsed) {
+        Result.Ok(c) => c,
+        Result.Err(e) => return fail("AuthorizationHeaderMalformed", e),
+    };
+    let key = match (config.find_key(ctx.cfg, claim.access_key)) {
+        Option.Some(k) => k,
+        Option.None => return fail(
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records."
+        ),
+    };
+    if (claim.service != "s3") {
+        return fail("AuthorizationHeaderMalformed", "the credential scope must be for s3");
+    }
+    let payload = if (presigned) {
+        sigv4.UNSIGNED
+    } else {
+        req.headers.get_or("x-amz-content-sha256", sigv4.UNSIGNED)
+    };
+    match (sigv4.verify(
+        claim,
+        key.secret,
+        req.method,
+        req.raw_path,
+        req.query,
+        req.headers,
+        payload,
+        time.now()
+    )) {
+        Result.Ok(_) => { },
+        Result.Err("expired") => return fail("AccessDenied", "Request has expired"),
+        Result.Err("skewed") => return fail(
+            "RequestTimeTooSkewed",
+            "The difference between the request time and the current time is too large."
+        ),
+        Result.Err("mismatch") => return fail(
+            "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature you provided."
+        ),
+        Result.Err(e) => return fail("AccessDenied", e),
+    }
+    let signing = Signing {
+        key: sigv4.signing_key(key.secret, claim.scope_date, claim.region, claim.service),
+        amz_date: claim.amz_date,
+        scope: sigv4.scope(claim.scope_date, claim.region, claim.service),
+        seed: claim.signature
+    };
+    Result.Ok(Who.Signed(key, signing))
+}
+
+fn denied<T>() -> Result<T, Fail> {
+    fail("AccessDenied", "Access Denied")
+}
+
+fn may_read(who: Who, bucket: string) -> Result<int, Fail> {
+    match (who) {
+        Who.Signed(k, _) => if (config.allows(k, bucket)) { Result.Ok(0) } else { denied() },
+        Who.Anonymous => denied(),
+    }
+}
+
+fn may_write(who: Who, bucket: string) -> Result<int, Fail> {
+    match (who) {
+        Who.Signed(k, _) => if (k.write && config.allows(k, bucket)) {
+            Result.Ok(0)
+        } else {
+            denied()
+        },
+        Who.Anonymous => denied(),
+    }
+}
+
+// Reading an object: the key's buckets, or anyone if the object is public-read.
+fn may_read_object(who: Who, o: index.Object) -> Result<int, Fail> {
+    if (o.acl == "public-read") {
+        return Result.Ok(0);
+    }
+    may_read(who, o.bucket)
+}
+
+fn owner_of(who: Who) -> string {
+    match (who) {
+        Who.Signed(k, _) => k.name,
+        Who.Anonymous => "anonymous",
+    }
+}
+
+fn acl_of(req: webserver.Request) -> Result<string, Fail> {
+    match (req.headers.get_or("x-amz-acl", "private")) {
+        "private" => Result.Ok("private"),
+        "public-read" => Result.Ok("public-read"),
+        other => fail("NotImplemented", "canned ACL '${other}' is not supported (private, public-read)"),
+    }
+}
+
+// --- The body: plain, or aws-chunked (signed chunk by chunk, or unsigned with a trailer) ---
+
+fn body_of(ctx: Ctx, req: webserver.Request, who: Who) -> Result<bytes, Fail> {
+    let mode = req.headers.get_or("x-amz-content-sha256", sigv4.UNSIGNED);
+    let body = if (mode.starts_with("STREAMING-")) {
+        let signing = match (who) {
+            Who.Signed(_, s) => if (mode == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+                Option.Some(s)
+            } else {
+                Option.None
+            },
+            Who.Anonymous => Option.None,
+        };
+        if (mode != "STREAMING-UNSIGNED-PAYLOAD-TRAILER" && signing.is_none()) {
+            return fail("NotImplemented", "x-amz-content-sha256 '${mode}' is not supported");
+        }
+        let decoded = dechunk(req.body, signing)?;
+        let declared = parse_int(req.headers.get_or("x-amz-decoded-content-length", "-1")).unwrap_or(
+            -1
+        );
+        if (declared >= 0 && declared != decoded.len()) {
+            return fail(
+                "IncompleteBody",
+                "the decoded body is not x-amz-decoded-content-length long"
+            );
+        }
+        decoded
+    } else {
+        if (mode != sigv4.UNSIGNED && sigv4.sha256_hex(req.body) != mode) {
+            return fail(
+                "XAmzContentSHA256Mismatch",
+                "The provided 'x-amz-content-sha256' header does not match what was computed."
+            );
+        }
+        req.body
+    };
+    if (body.len() > ctx.cfg.max_object) {
+        return fail(
+            "EntityTooLarge",
+            "Your proposed upload exceeds the maximum allowed size (${ctx.cfg.max_object} bytes); use a multipart upload"
+        );
+    }
+    Result.Ok(body)
+}
+
+fn hex_int(s: string) -> Option<int> {
+    if (s == "" || s.len() > 15) {
+        return Option.None;
+    }
+    var n = 0;
+    for c in s.to_lower().chars() {
+        let d = "0123456789abcdef".index_of(to_string(c))?;
+        n = n * 16 + d;
+    }
+    Option.Some(n)
+}
+
+const EMPTY_SHA: string = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// Decodes an `aws-chunked` body: `<hex size>[;chunk-signature=<sig>]\r\n<data>\r\n` until a
+/// chunk of size 0 (trailers after it are ignored). With `signing`, every chunk's signature
+/// must chain from the previous one, starting at the header's.
+pub fn dechunk(body: bytes, signing: Option<Signing>) -> Result<bytes, Fail> {
+    var parts: [bytes] = [];
+    var pos = 0;
+    var prev = match (signing) {
+        Option.Some(s) => s.seed,
+        Option.None => "",
+    };
+    let crlf = "\r\n".to_bytes();
+    while (true) {
+        let eol = match (body.index_of_from(crlf, pos)) {
+            Option.Some(i) => i,
+            Option.None => return fail("IncompleteBody", "truncated aws-chunked body"),
+        };
+        let line = match (from_utf8(body.sub_bytes(pos, eol))) {
+            Result.Ok(s) => s,
+            Result.Err(_) => return fail("InvalidRequest", "bad chunk header"),
+        };
+        let (size_hex, sig) = match (line.index_of(";")) {
+            Option.Some(i) => (
+                line.substring(0, i),
+                line.substring(i + 1, line.len()).strip_prefix("chunk-signature=").unwrap_or("")
+            ),
+            Option.None => (line, ""),
+        };
+        let size = match (hex_int(size_hex.trim())) {
+            Option.Some(n) => n,
+            Option.None => return fail("InvalidRequest", "bad chunk size '${size_hex}'"),
+        };
+        let start = eol + 2;
+        if (start + size > body.len()) {
+            return fail("IncompleteBody", "truncated aws-chunked body");
+        }
+        let data = body.sub_bytes(start, start + size);
+        match (signing) {
+            Option.Some(s) => {
+                let sts = "AWS4-HMAC-SHA256-PAYLOAD\n${s.amz_date}\n${s.scope}\n${prev}\n${EMPTY_SHA}\n${sigv4.sha256_hex(data)}";
+                let want = hmac_hex(s.key, sts);
+                if (want != sig) {
+                    return fail("SignatureDoesNotMatch", "chunk signature mismatch");
+                }
+                prev = want;
+            },
+            Option.None => { },
+        }
+        if (size == 0) {
+            break;
+        }
+        parts.push(data);
+        pos = start + size + 2;
+    }
+    Result.Ok(bytes_concat(parts))
+}
+
+fn hmac_hex(key: bytes, msg: string) -> string {
+    hex.hex_encode(crypto.hmac_sha256(key, msg.to_bytes()))
+}
+
+// --- Buckets ---
+
+fn valid_bucket(name: string) -> bool {
+    if (name.len() < 3 || name.len() > 63) {
+        return false;
+    }
+    for c in name.chars() {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.')) {
+            return false;
+        }
+    }
+    let first = name[0];
+    let last = name[name.len() - 1];
+    first != '-' && first != '.' && last != '-' && last != '.' && !name.contains("..")
+}
+
+fn create_bucket(ctx: Ctx, who: Who, bucket: string) -> Result<webserver.Response, Fail> {
+    may_write(who, bucket)?;
+    if (!valid_bucket(bucket)) {
+        return fail("InvalidBucketName", "The specified bucket is not valid.");
+    }
+    index.ask_create_bucket(ctx.ix, bucket, time.now()).map_err(no_such)?;
+    let r = empty(200);
+    r.headers.insert("Location", "/${bucket}");
+    Result.Ok(r)
+}
+
+fn list_buckets(ctx: Ctx, who: Who) -> Result<webserver.Response, Fail> {
+    let k = match (who) {
+        Who.Signed(k, _) => k,
+        Who.Anonymous => return denied(),
+    };
+    var list = xml.element("Buckets");
+    for b in index.ask_buckets(ctx.ix) {
+        if (config.allows(k, b.name)) {
+            list = list.with_child(xml.element("Bucket")
+                .with_child(text_el("Name", b.name))
+                .with_child(text_el("CreationDate", iso(b.created_ms))));
+        }
+    }
+    let e = root_el("ListAllMyBucketsResult").with_child(owner_el(k.name)).with_child(list);
+    Result.Ok(xml_response(200, e))
+}
+
+fn owner_el(name: string) -> xml.Elem {
+    xml.element("Owner").with_child(text_el("ID", name)).with_child(text_el("DisplayName", name))
+}
+
+fn iso(ms: int) -> string {
+    let s = time.to_iso8601(time.from_epoch_millis(ms));
+    let millis = to_string(1000 + ms % 1000).substring(1, 4);
+    s.substring(0, s.len() - 1) + "." + millis + "Z"
+}
+
+fn http_date(ms: int) -> string {
+    time.to_rfc1123(time.from_epoch_millis(ms))
+}
+
+// --- Listing ---
+
+fn list_objects(
+    ctx: Ctx,
+    q: Map<string, string>,
+    bucket: string
+) -> Result<webserver.Response, Fail> {
+    let v2 = q.get_or("list-type", "") == "2";
+    let max = match (parse_int(q.get_or("max-keys", "1000"))) {
+        Option.Some(n) => if (n < 0) {
+            return fail("InvalidArgument", "max-keys must be >= 0");
+        } else if (n > 1000) { 1000 } else { n },
+        Option.None => return fail("InvalidArgument", "max-keys must be an integer"),
+    };
+    let prefix = q.get_or("prefix", "");
+    let delimiter = q.get_or("delimiter", "");
+    let token = q.get_or("continuation-token", "");
+    let after = if (v2) {
+        if (token != "") {
+            match (base64.base64url_decode(token)) {
+                Result.Ok(b) => from_utf8(b).unwrap_or(""),
+                Result.Err(_) => return fail("InvalidArgument", "The continuation token provided is incorrect"),
+            }
+        } else {
+            q.get_or("start-after", "")
+        }
+    } else {
+        q.get_or("marker", "")
+    };
+    let listing = if (max == 0) {
+        index.Listing { objects: [], prefixes: [], truncated: false, next: "" }
+    } else {
+        index.ask_list(ctx.ix, index.Query {
+            bucket: bucket,
+            prefix: prefix,
+            delimiter: delimiter,
+            after: after,
+            max_keys: max
+        })
+            .map_err(no_such)?
+    };
+    let encode = q.get_or("encoding-type", "") == "url";
+    let enc = fn(s: string) -> string {
+        if (encode) { sigv4.encode_path(s) } else { s }
+    };
+    var e = root_el("ListBucketResult")
+        .with_child(text_el("Name", bucket))
+        .with_child(text_el("Prefix", enc(prefix)))
+        .with_child(text_el("MaxKeys", to_string(max)))
+        .with_child(text_el("IsTruncated", if (listing.truncated) { "true" } else { "false" }));
+    if (delimiter != "") {
+        e = e.with_child(text_el("Delimiter", enc(delimiter)));
+    }
+    if (encode) {
+        e = e.with_child(text_el("EncodingType", "url"));
+    }
+    if (v2) {
+        e = e.with_child(
+            text_el("KeyCount", to_string(listing.objects.len() + listing.prefixes.len()))
+        );
+        if (token != "") {
+            e = e.with_child(text_el("ContinuationToken", token));
+        }
+        if (q.contains_key("start-after")) {
+            e = e.with_child(text_el("StartAfter", enc(q.get_or("start-after", ""))));
+        }
+        if (listing.truncated) {
+            e = e.with_child(
+                text_el("NextContinuationToken", base64.base64url(listing.next.to_bytes()))
+            );
+        }
+    } else {
+        e = e.with_child(text_el("Marker", enc(after)));
+        if (listing.truncated) {
+            e = e.with_child(text_el("NextMarker", enc(listing.next)));
+        }
+    }
+    for o in listing.objects {
+        e = e.with_child(xml.element("Contents")
+            .with_child(text_el("Key", enc(o.key)))
+            .with_child(text_el("LastModified", iso(o.mtime_ms)))
+            .with_child(text_el("ETag", "\"${o.etag}\""))
+            .with_child(text_el("Size", to_string(o.size)))
+            .with_child(text_el("StorageClass", "STANDARD")));
+    }
+    for p in listing.prefixes {
+        e = e.with_child(xml.element("CommonPrefixes").with_child(text_el("Prefix", enc(p))));
+    }
+    Result.Ok(xml_response(200, e))
+}
+
+// --- Objects ---
+
+fn meta_of(req: webserver.Request) -> string {
+    var lines: [string] = [];
+    for name in sort(req.headers.keys()) {
+        if (name.starts_with("x-amz-meta-")) {
+            lines.push("${name}: ${req.headers.get_or(name, "")}");
+        }
+    }
+    join(lines, "\n")
+}
+
+fn content_type_of(req: webserver.Request) -> string {
+    req.headers.get_or("content-type", "binary/octet-stream")
+}
+
+fn put_object(
+    ctx: Ctx,
+    req: webserver.Request,
+    who: Who,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    let acl = acl_of(req)?;
+    exists(ctx, bucket)?;
+    let body = body_of(ctx, req, who)?;
+    let w = write_blob(ctx, req, body)?;
+    let o = index.Object {
+        bucket: bucket,
+        key: key,
+        blob: w.id,
+        size: w.size,
+        etag: w.md5,
+        content_type: content_type_of(req),
+        meta: meta_of(req),
+        acl: acl,
+        mtime_ms: time.now()
+    };
+    commit(ctx, o)?;
+    let r = empty(200);
+    r.headers.insert("ETag", "\"${w.md5}\"");
+    Result.Ok(r)
+}
+
+// Writes the body as a blob; a `Content-MD5` that does not match the MD5 computed while
+// writing undoes it.
+fn write_blob(ctx: Ctx, req: webserver.Request, body: bytes) -> Result<blobs.Written, Fail> {
+    let w = match (blobs.write(ctx.cfg.data, body)) {
+        Result.Ok(w) => w,
+        Result.Err(e) => return fail("InternalError", "could not store the object: ${e}"),
+    };
+    match (req.headers.get("content-md5")) {
+        Option.Some(want) => {
+            let ok = match (base64.base64_decode(want.trim())) {
+                Result.Ok(b) => hex.hex_encode(b) == w.md5,
+                Result.Err(_) => false,
+            };
+            if (!ok) {
+                blobs.remove(ctx.cfg.data, w.id);
+                return fail(
+                    "BadDigest",
+                    "The Content-MD5 you specified did not match what we received."
+                );
+            }
+        },
+        Option.None => { },
+    }
+    Result.Ok(w)
+}
+
+// Points the index at a written blob; if the index refuses, the blob goes.
+fn commit(ctx: Ctx, o: index.Object) -> Result<int, Fail> {
+    match (index.ask_put(ctx.ix, o)) {
+        Result.Ok(freed) => {
+            free(ctx, freed);
+            Result.Ok(0)
+        },
+        Result.Err(code) => {
+            blobs.remove(ctx.cfg.data, o.blob);
+            Result.Err(no_such(code))
+        },
+    }
+}
+
+fn get_object(
+    ctx: Ctx,
+    req: webserver.Request,
+    q: Map<string, string>,
+    who: Who,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    // Who may not read the bucket must not learn whether a key exists in it.
+    let o = match (index.ask_head(ctx.ix, bucket, key)) {
+        Option.Some(o) => o,
+        Option.None => {
+            may_read(who, bucket)?;
+            exists(ctx, bucket)?;
+            return Result.Err(no_such("NoSuchKey"));
+        },
+    };
+    may_read_object(who, o)?;
+    let etag = "\"${o.etag}\"";
+    let if_match = req.headers.get_or("if-match", "");
+    if (if_match != "" && if_match != etag && if_match != "*") {
+        return fail(
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold"
+        );
+    }
+    let if_none = req.headers.get_or("if-none-match", "");
+    if (if_none != "" && (if_none == etag || if_none == "*")) {
+        let r = empty(304);
+        r.headers.insert("ETag", etag);
+        return Result.Ok(r);
+    }
+    // serve_file does Range and HEAD; its own validators (size + mtime) are not S3's.
+    req.headers.remove("if-none-match");
+    req.headers.remove("if-match");
+    let ifr = req.headers.get_or("if-range", "");
+    if (ifr != "") {
+        req.headers.remove("if-range");
+        if (ifr != etag) {
+            req.headers.remove("range");
+        }
+    }
+    let r = webserver.serve_file(blobs.path(ctx.cfg.data, o.blob), req);
+    if (r.status == 404) {
+        // Overwritten or deleted between the lookup and the read.
+        return Result.Err(no_such("NoSuchKey"));
+    }
+    if (r.status == 416) {
+        return fail("InvalidRange", "The requested range is not satisfiable");
+    }
+    r.headers.insert("ETag", etag);
+    r.headers.insert("Last-Modified", http_date(o.mtime_ms));
+    r.headers.insert("Content-Type", q.get_or("response-content-type", o.content_type));
+    for (h, p) in [
+        ("Content-Disposition", "response-content-disposition"),
+        ("Cache-Control", "response-cache-control"),
+        ("Content-Language", "response-content-language")
+    ] {
+        if (q.contains_key(p)) {
+            r.headers.insert(h, q.get_or(p, ""));
+        }
+    }
+    if (o.meta != "") {
+        for line in o.meta.split(
+            "\n"
+        ) {
+            match (line.index_of(": ")) {
+                Option.Some(i) => r.headers.insert(line.substring(0, i), line.substring(i + 2, line.len())),
+                Option.None => { },
+            }
+        }
+    }
+    Result.Ok(r)
+}
+
+fn get_acl(ctx: Ctx, who: Who, bucket: string, key: string) -> Result<webserver.Response, Fail> {
+    may_read(who, bucket)?;
+    let o = match (index.ask_head(ctx.ix, bucket, key)) {
+        Option.Some(o) => o,
+        Option.None => return Result.Err(no_such("NoSuchKey")),
+    };
+    let owner = owner_of(who);
+    var grants = xml.element("AccessControlList")
+        .with_child(grant_el(owner_grantee(owner), "FULL_CONTROL"));
+    if (o.acl == "public-read") {
+        let all = xml.element("Grantee")
+            .with_attr("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+            .with_attr("xsi:type", "Group")
+            .with_child(text_el("URI", "http://acs.amazonaws.com/groups/global/AllUsers"));
+        grants = grants.with_child(grant_el(all, "READ"));
+    }
+    Result.Ok(
+        xml_response(
+            200,
+            root_el("AccessControlPolicy").with_child(owner_el(owner)).with_child(grants)
+        )
+    )
+}
+
+fn owner_grantee(name: string) -> xml.Elem {
+    xml.element("Grantee")
+        .with_attr("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+        .with_attr("xsi:type", "CanonicalUser")
+        .with_child(text_el("ID", name))
+        .with_child(text_el("DisplayName", name))
+}
+
+fn grant_el(grantee: xml.Elem, permission: string) -> xml.Elem {
+    xml.element("Grant").with_child(grantee).with_child(text_el("Permission", permission))
+}
+
+fn copy_object(
+    ctx: Ctx,
+    req: webserver.Request,
+    who: Who,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    let raw = req.headers.get_or("x-amz-copy-source", "");
+    let src = decode(raw.strip_prefix("/").unwrap_or(raw))?;
+    let src = match (src.index_of("?")) {
+        Option.Some(i) => src.substring(0, i),
+        Option.None => src,
+    };
+    let (sb, sk) = match (src.index_of("/")) {
+        Option.Some(i) => (src.substring(0, i), src.substring(i + 1, src.len())),
+        Option.None => return fail("InvalidArgument", "x-amz-copy-source must be bucket/key"),
+    };
+    let from = match (index.ask_head(ctx.ix, sb, sk)) {
+        Option.Some(o) => o,
+        Option.None => {
+            may_read(who, sb)?;
+            return Result.Err(no_such("NoSuchKey"));
+        },
+    };
+    may_read_object(who, from)?;
+    let replace = req.headers.get_or("x-amz-metadata-directive", "COPY") == "REPLACE";
+    if (sb == bucket && sk == key && !replace) {
+        return fail(
+            "InvalidRequest",
+            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata"
+        );
+    }
+    let acl = acl_of(req)?;
+    let w = match (blobs.concat(ctx.cfg.data, [from.blob])) {
+        Result.Ok(v) => v,
+        Result.Err(e) => return fail("InternalError", "could not copy: ${e}"),
+    };
+    let now = time.now();
+    let o = index.Object {
+        bucket: bucket,
+        key: key,
+        blob: w.id,
+        size: w.size,
+        etag: from.etag,
+        content_type: if (replace) { content_type_of(req) } else { from.content_type },
+        meta: if (replace) { meta_of(req) } else { from.meta },
+        acl: acl,
+        mtime_ms: now
+    };
+    commit(ctx, o)?;
+    let e = root_el("CopyObjectResult")
+        .with_child(text_el("LastModified", iso(now)))
+        .with_child(text_el("ETag", "\"${from.etag}\""));
+    Result.Ok(xml_response(200, e))
+}
+
+fn delete_objects(
+    ctx: Ctx,
+    req: webserver.Request,
+    who: Who,
+    bucket: string
+) -> Result<webserver.Response, Fail> {
+    let doc = parse_xml(body_of(ctx, req, who)?)?;
+    let quiet = doc.text_of("Quiet") == "true";
+    let objects = doc.children_named("Object");
+    if (objects.len() > 1000) {
+        return fail("MalformedXML", "at most 1000 keys per request");
+    }
+    var e = root_el("DeleteResult");
+    for ob in objects {
+        let key = ob.text_of("Key");
+        match (index.ask_delete(ctx.ix, bucket, key)) {
+            Result.Ok(freed) => {
+                free(ctx, freed);
+                if (!quiet) {
+                    e = e.with_child(xml.element("Deleted").with_child(text_el("Key", key)));
+                }
+            },
+            Result.Err(code) => {
+                let f = no_such(code);
+                e = e.with_child(xml.element("Error")
+                    .with_child(text_el("Key", key))
+                    .with_child(text_el("Code", f.code))
+                    .with_child(text_el("Message", f.message)));
+            },
+        }
+    }
+    Result.Ok(xml_response(200, e))
+}
+
+fn parse_xml(body: bytes) -> Result<xml.Elem, Fail> {
+    let text = match (from_utf8(body)) {
+        Result.Ok(t) => t,
+        Result.Err(_) => return fail("MalformedXML", "the body is not UTF-8"),
+    };
+    match (xml.parse(text)) {
+        Result.Ok(e) => Result.Ok(e),
+        Result.Err(_) => fail(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema."
+        ),
+    }
+}
+
+// --- Multipart ---
+
+fn create_upload(
+    ctx: Ctx,
+    req: webserver.Request,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    let acl = acl_of(req)?;
+    let id = uuid.uuid_v7().replace("-", "");
+    let u = index.Upload {
+        id: id,
+        bucket: bucket,
+        key: key,
+        content_type: content_type_of(req),
+        meta: meta_of(req),
+        acl: acl,
+        created_ms: time.now()
+    };
+    index.ask_create_upload(ctx.ix, u).map_err(no_such)?;
+    let e = root_el("InitiateMultipartUploadResult")
+        .with_child(text_el("Bucket", bucket))
+        .with_child(text_el("Key", key))
+        .with_child(text_el("UploadId", id));
+    Result.Ok(xml_response(200, e))
+}
+
+fn upload_of(ctx: Ctx, id: string, bucket: string, key: string) -> Result<index.Upload, Fail> {
+    match (index.ask_upload(ctx.ix, id)) {
+        Option.Some(u) => if (u.bucket == bucket && u.key == key) {
+            Result.Ok(u)
+        } else {
+            Result.Err(no_such("NoSuchUpload"))
+        },
+        Option.None => Result.Err(no_such("NoSuchUpload")),
+    }
+}
+
+fn upload_part(
+    ctx: Ctx,
+    req: webserver.Request,
+    q: Map<string, string>,
+    who: Who,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    let id = q.get_or("uploadId", "");
+    let number = match (parse_int(q.get_or("partNumber", ""))) {
+        Option.Some(n) => if (n >= 1 && n <= MAX_PARTS) {
+            n
+        } else {
+            return fail(
+                "InvalidArgument",
+                "Part number must be an integer between 1 and 10000, inclusive"
+            );
+        },
+        Option.None => return fail("InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive"),
+    };
+    upload_of(ctx, id, bucket, key)?;
+    let body = body_of(ctx, req, who)?;
+    let w = write_blob(ctx, req, body)?;
+    match (index.ask_put_part(
+        ctx.ix,
+        id,
+        index.Part { number: number, blob: w.id, size: w.size, etag: w.md5 }
+    )) {
+        Result.Ok(freed) => free(ctx, freed),
+        Result.Err(code) => {
+            blobs.remove(ctx.cfg.data, w.id);
+            return Result.Err(no_such(code));
+        },
+    }
+    let r = empty(200);
+    r.headers.insert("ETag", "\"${w.md5}\"");
+    Result.Ok(r)
+}
+
+fn list_parts(
+    ctx: Ctx,
+    id: string,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    upload_of(ctx, id, bucket, key)?;
+    var e = root_el("ListPartsResult")
+        .with_child(text_el("Bucket", bucket))
+        .with_child(text_el("Key", key))
+        .with_child(text_el("UploadId", id))
+        .with_child(text_el("IsTruncated", "false"));
+    for p in index.ask_parts(ctx.ix, id) {
+        e = e.with_child(xml.element("Part")
+            .with_child(text_el("PartNumber", to_string(p.number)))
+            .with_child(text_el("ETag", "\"${p.etag}\""))
+            .with_child(text_el("Size", to_string(p.size))));
+    }
+    Result.Ok(xml_response(200, e))
+}
+
+fn complete_upload(
+    ctx: Ctx,
+    req: webserver.Request,
+    who: Who,
+    id: string,
+    bucket: string,
+    key: string
+) -> Result<webserver.Response, Fail> {
+    let u = upload_of(ctx, id, bucket, key)?;
+    let doc = parse_xml(body_of(ctx, req, who)?)?;
+    let stored: Map<int, index.Part> = Map.new();
+    for p in index.ask_parts(ctx.ix, id) {
+        stored.insert(p.number, p);
+    }
+    let asked = doc.children_named("Part");
+    if (asked.len() == 0) {
+        return fail(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema."
+        );
+    }
+    var chosen: [index.Part] = [];
+    var last = 0;
+    for a in asked {
+        let n = parse_int(a.text_of("PartNumber").trim()).unwrap_or(0);
+        if (n <= last) {
+            return fail(
+                "InvalidPartOrder",
+                "The list of parts was not in ascending order. The parts list must be specified in order by part number."
+            );
+        }
+        last = n;
+        let etag = a.text_of("ETag").trim().replace("\"", "");
+        let p = match (stored.get(n)) {
+            Option.Some(p) => if (p.etag == etag) { p } else {
+                return fail("InvalidPart", "part ${n}: the ETag does not match");
+            },
+            Option.None => return fail("InvalidPart", "part ${n} was not uploaded"),
+        };
+        chosen.push(p);
+    }
+    for i in 0..chosen.len() - 1 {
+        if (chosen[i].size < ctx.cfg.min_part) {
+            return fail(
+                "EntityTooSmall",
+                "Your proposed upload is smaller than the minimum allowed object size."
+            );
+        }
+    }
+    // The S3 multipart ETag: MD5 of the parts' binary MD5s, then -<count>.
+    var digests: [bytes] = [];
+    for p in chosen {
+        digests.push(hex.hex_decode(p.etag).unwrap_or(bytes_of([])));
+    }
+    let etag = md5.hex_of(bytes_concat(digests)) + "-${chosen.len()}";
+    let w = match (blobs.concat(ctx.cfg.data, chosen.map(fn(p: index.Part) -> string { p.blob }))) {
+        Result.Ok(v) => v,
+        Result.Err(e) => return fail("InternalError", "could not join the parts: ${e}"),
+    };
+    let o = index.Object {
+        bucket: bucket,
+        key: key,
+        blob: w.id,
+        size: w.size,
+        etag: etag,
+        content_type: u.content_type,
+        meta: u.meta,
+        acl: u.acl,
+        mtime_ms: time.now()
+    };
+    match (index.ask_complete(ctx.ix, id, o)) {
+        Result.Ok(freed) => free(ctx, freed),
+        Result.Err(code) => {
+            blobs.remove(ctx.cfg.data, w.id);
+            return Result.Err(no_such(code));
+        },
+    }
+    let e = root_el("CompleteMultipartUploadResult")
+        .with_child(text_el("Location", "/${bucket}/${sigv4.encode_path(key)}"))
+        .with_child(text_el("Bucket", bucket))
+        .with_child(text_el("Key", key))
+        .with_child(text_el("ETag", "\"${etag}\""));
+    Result.Ok(xml_response(200, e))
+}

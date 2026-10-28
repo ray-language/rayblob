@@ -1,0 +1,142 @@
+//! The bytes of objects and parts, one file each under `<data>/blobs/<xx>/<id>`. A blob is
+//! written to `<data>/tmp/`, synced and renamed into place before the index points at it,
+//! so the index never names a file that is half written. Blobs are immutable: an overwrite
+//! writes a new one and the old one is removed after the index stops naming it.
+
+import std/fs;
+import std/hex;
+import std/uuid;
+import md5;
+
+/// What was written: its id, size, and the hex MD5 that S3 calls the ETag.
+pub struct Written {
+    id: string,
+    size: int,
+    md5: string,
+}
+
+const CHUNK: int = 1024 * 1024;
+
+pub fn path(root: string, id: string) -> string {
+    "${root}/blobs/${fan(id)}/${id}"
+}
+
+// The last two hex digits of the id: uuid v7 starts with the clock, so the first ones
+// would put a day's blobs in one directory.
+fn fan(id: string) -> string {
+    id.substring(id.len() - 2, id.len())
+}
+
+pub fn init(root: string) -> Result<int, string> {
+    fs.mkdir("${root}/blobs")?;
+    fs.mkdir("${root}/tmp")?;
+    Result.Ok(0)
+}
+
+/// Writes `data` as a new blob.
+pub fn write(root: string, data: bytes) -> Result<Written, string> {
+    let id = uuid.uuid_v7().replace("-", "");
+    let tmp = "${root}/tmp/${id}";
+    let h = fs.open(tmp, "w")?;
+    let r = write_synced(h, data);
+    close(h);
+    match (r) {
+        Result.Ok(_) => { },
+        Result.Err(e) => {
+            fs.remove_file(tmp);
+            return Result.Err(e);
+        },
+    }
+    place(root, tmp, id)?;
+    Result.Ok(Written { id: id, size: data.len(), md5: digest(data) })
+}
+
+// MD5 a slice at a time (see md5.ray for why not std/crypto/md5).
+fn digest(data: bytes) -> string {
+    let h = md5.new();
+    var pos = 0;
+    while (pos < data.len()) {
+        let end = if (pos + CHUNK > data.len()) { data.len() } else { pos + CHUNK };
+        md5.update(h, data.sub_bytes(pos, end));
+        pos = end;
+    }
+    hex.hex_encode(md5.finish(h))
+}
+
+fn write_synced(h: int, data: bytes) -> Result<int, string> {
+    fs.write_bytes(h, data)?;
+    fs.sync_data(h)
+}
+
+fn place(root: string, tmp: string, id: string) -> Result<int, string> {
+    fs.mkdir("${root}/blobs/${fan(id)}")?;
+    match (fs.rename(tmp, path(root, id))) {
+        Result.Ok(n) => Result.Ok(n),
+        Result.Err(e) => {
+            fs.remove_file(tmp);
+            Result.Err(e)
+        },
+    }
+}
+
+/// Joins blobs, in order, into a new one, a chunk at a time: completing a multipart upload
+/// never holds more than one chunk in memory. The result carries no MD5 (S3 does not use it).
+pub fn concat(root: string, ids: [string]) -> Result<Written, string> {
+    let id = uuid.uuid_v7().replace("-", "");
+    let tmp = "${root}/tmp/${id}";
+    let out = fs.open(tmp, "w")?;
+    let r = copy_all(root, ids, out);
+    close(out);
+    let size = match (r) {
+        Result.Ok(v) => v,
+        Result.Err(e) => {
+            fs.remove_file(tmp);
+            return Result.Err(e);
+        },
+    };
+    place(root, tmp, id)?;
+    Result.Ok(Written { id: id, size: size, md5: "" })
+}
+
+fn copy_all(root: string, ids: [string], out: int) -> Result<int, string> {
+    var size = 0;
+    for id in ids {
+        let h = fs.open(path(root, id), "r")?;
+        let r = copy_one(h, out);
+        close(h);
+        size = size + r?;
+    }
+    fs.sync_data(out)?;
+    Result.Ok(size)
+}
+
+fn copy_one(h: int, out: int) -> Result<int, string> {
+    var n = 0;
+    while (true) {
+        match (fs.read_bytes(h, CHUNK)?) {
+            Option.Some(b) => {
+                fs.write_bytes(out, b)?;
+                n = n + b.len();
+            },
+            Option.None => return Result.Ok(n),
+        }
+    }
+}
+
+pub fn remove(root: string, id: string) {
+    fs.remove_file(path(root, id));
+}
+
+/// Every blob id on disk, and the leftovers of writes that never finished are deleted.
+pub fn scan(root: string) -> Result<[string], string> {
+    for t in fs.list_dir("${root}/tmp")? {
+        fs.remove_file("${root}/tmp/${t}");
+    }
+    var ids: [string] = [];
+    for d in fs.list_dir("${root}/blobs")? {
+        for f in fs.list_dir("${root}/blobs/${d}")? {
+            ids.push(f);
+        }
+    }
+    Result.Ok(ids)
+}

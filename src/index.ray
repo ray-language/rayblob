@@ -1,0 +1,622 @@
+//! The index: buckets, objects, multipart uploads and their parts, in SQLite, owned by one
+//! fiber. Handlers ask it over a channel; the bytes never pass through it (they are blobs,
+//! written by the handler's own fiber before it asks).
+
+import blobs;
+import db/sqlite;
+
+pub struct Bucket {
+    name: string,
+    created_ms: int,
+}
+
+pub struct Object {
+    bucket: string,
+    key: string,
+    blob: string,
+    size: int,
+    etag: string,
+    content_type: string,
+    /// `x-amz-meta-*` headers, one `name: value` per line.
+    meta: string,
+    /// `private` or `public-read`.
+    acl: string,
+    mtime_ms: int,
+}
+
+pub struct Upload {
+    id: string,
+    bucket: string,
+    key: string,
+    content_type: string,
+    meta: string,
+    acl: string,
+    created_ms: int,
+}
+
+pub struct Part {
+    number: int,
+    blob: string,
+    size: int,
+    etag: string,
+}
+
+pub struct Query {
+    bucket: string,
+    prefix: string,
+    delimiter: string,
+    /// Exclusive: the listing starts after this key (or common prefix).
+    after: string,
+    max_keys: int,
+}
+
+pub struct Listing {
+    objects: [Object],
+    prefixes: [string],
+    truncated: bool,
+    /// What to resume after, when `truncated`.
+    next: string,
+}
+
+/// What a write displaced: blobs nobody names any more, for the caller to delete.
+pub type Freed = [string];
+
+pub enum Msg {
+    Buckets(Channel<[Bucket]>),
+    HasBucket(string, Channel<bool>),
+    CreateBucket(string, int, Channel<Result<int, string>>),
+    DeleteBucket(string, Channel<Result<int, string>>),
+    Head(string, string, Channel<Option<Object>>),
+    Put(Object, Channel<Result<Freed, string>>),
+    Delete(string, string, Channel<Result<Freed, string>>),
+    SetAcl(string, string, string, Channel<Result<int, string>>),
+    List(Query, Channel<Result<Listing, string>>),
+    CreateUpload(Upload, Channel<Result<int, string>>),
+    GetUpload(string, Channel<Option<Upload>>),
+    PutPart(string, Part, Channel<Result<Freed, string>>),
+    Parts(string, Channel<[Part]>),
+    Complete(string, Object, Channel<Result<Freed, string>>),
+    Abort(string, Channel<Result<Freed, string>>),
+    Stop(Channel<int>),
+}
+
+const SCHEMA: string = `
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = FULL;
+CREATE TABLE IF NOT EXISTS buckets (
+    name TEXT PRIMARY KEY,
+    created_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS objects (
+    bucket TEXT NOT NULL,
+    key TEXT NOT NULL,
+    blob TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    etag TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    meta TEXT NOT NULL,
+    acl TEXT NOT NULL,
+    mtime_ms INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS uploads (
+    id TEXT PRIMARY KEY,
+    bucket TEXT NOT NULL,
+    key TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    meta TEXT NOT NULL,
+    acl TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS parts (
+    upload TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    blob TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    etag TEXT NOT NULL,
+    PRIMARY KEY (upload, number)
+) WITHOUT ROWID;
+`;
+
+const OBJECT_COLS: string = "bucket, key, blob, size, etag, content_type, meta, acl, mtime_ms";
+
+/// Opens (or creates) the index under `root` and starts its fiber. Blobs on disk that the
+/// index does not name (a crash between writing one and committing it) are deleted first.
+pub fn start(root: string) -> Result<Channel<Msg>, string> {
+    blobs.init(root)?;
+    let c = sqlite.connect("${root}/index.db")?;
+    sqlite.exec(c, SCHEMA, [])?;
+    let named: Map<string, bool> = Map.new();
+    for row in sqlite.query(c, "SELECT blob FROM objects UNION ALL SELECT blob FROM parts", [])? {
+        named.insert(row[0], true);
+    }
+    for id in blobs.scan(root)? {
+        if (!named.contains_key(id)) {
+            blobs.remove(root, id);
+        }
+    }
+    sqlite.disconnect(c);
+    let inbox: Channel<Msg> = Channel.bounded(256);
+    let ready: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        match (sqlite.connect("${root}/index.db")) {
+            Result.Ok(conn) => {
+                // Annotated: a bare `Result.Ok(0)` in send() does not build natively (finding).
+                let up: Result<int, string> = Result.Ok(0);
+                send(ready, up);
+                serve(conn, inbox);
+                sqlite.disconnect(conn);
+            },
+            Result.Err(e) => {
+                let down: Result<int, string> = Result.Err(e);
+                send(ready, down);
+            },
+        }
+    });
+    recv(ready).unwrap_or(Result.Err("index fiber died"))?;
+    Result.Ok(inbox)
+}
+
+fn serve(c: sqlite.Conn, inbox: Channel<Msg>) {
+    while (true) {
+        let m = match (recv(inbox)) {
+            Option.Some(m) => m,
+            Option.None => return,
+        };
+        match (m) {
+            Msg.Buckets(r) => send(r, buckets(c)),
+            Msg.HasBucket(name, r) => send(r, has_bucket(c, name)),
+            Msg.CreateBucket(name, now, r) => send(r, create_bucket(c, name, now)),
+            Msg.DeleteBucket(name, r) => send(r, delete_bucket(c, name)),
+            Msg.Head(b, k, r) => send(r, head(c, b, k)),
+            Msg.Put(o, r) => send(r, put(c, o)),
+            Msg.Delete(b, k, r) => send(r, delete(c, b, k)),
+            Msg.SetAcl(b, k, acl, r) => send(r, set_acl(c, b, k, acl)),
+            Msg.List(q, r) => send(r, list(c, q)),
+            Msg.CreateUpload(u, r) => send(r, create_upload(c, u)),
+            Msg.GetUpload(id, r) => send(r, get_upload(c, id)),
+            Msg.PutPart(id, p, r) => send(r, put_part(c, id, p)),
+            Msg.Parts(id, r) => send(r, parts(c, id)),
+            Msg.Complete(id, o, r) => send(r, complete(c, id, o)),
+            Msg.Abort(id, r) => send(r, abort(c, id)),
+            Msg.Stop(r) => {
+                send(r, 0);
+                return;
+            },
+        }
+    }
+}
+
+fn num(s: string) -> int {
+    parse_int(s).unwrap_or(0)
+}
+
+fn buckets(c: sqlite.Conn) -> [Bucket] {
+    match (sqlite.query(c, "SELECT name, created_ms FROM buckets ORDER BY name", [])) {
+        Result.Ok(rows) => rows.map(fn(r: [string]) -> Bucket { Bucket { name: r[0], created_ms: num(r[1]) } }),
+        Result.Err(_) => [],
+    }
+}
+
+fn has_bucket(c: sqlite.Conn, name: string) -> bool {
+    match (sqlite.query(c, "SELECT 1 FROM buckets WHERE name = ?1", [name])) {
+        Result.Ok(rows) => rows.len() > 0,
+        Result.Err(_) => false,
+    }
+}
+
+fn create_bucket(c: sqlite.Conn, name: string, now: int) -> Result<int, string> {
+    if (has_bucket(c, name)) {
+        return Result.Err("BucketAlreadyOwnedByYou");
+    }
+    sqlite.exec(c, "INSERT INTO buckets (name, created_ms) VALUES (?1, ?2)", [name, to_string(now)])
+}
+
+fn delete_bucket(c: sqlite.Conn, name: string) -> Result<int, string> {
+    if (!has_bucket(c, name)) {
+        return Result.Err("NoSuchBucket");
+    }
+    let rows = sqlite.query(
+        c,
+        "SELECT 1 FROM objects WHERE bucket = ?1 UNION ALL SELECT 1 FROM uploads WHERE bucket = ?1 LIMIT 1",
+        [name]
+    )?;
+    if (rows.len() > 0) {
+        return Result.Err("BucketNotEmpty");
+    }
+    sqlite.exec(c, "DELETE FROM buckets WHERE name = ?1", [name])
+}
+
+fn object_of(r: [string]) -> Object {
+    Object {
+        bucket: r[0],
+        key: r[1],
+        blob: r[2],
+        size: num(r[3]),
+        etag: r[4],
+        content_type: r[5],
+        meta: r[6],
+        acl: r[7],
+        mtime_ms: num(r[8])
+    }
+}
+
+fn head(c: sqlite.Conn, bucket: string, key: string) -> Option<Object> {
+    match (sqlite.query(
+        c,
+        "SELECT ${OBJECT_COLS} FROM objects WHERE bucket = ?1 AND key = ?2",
+        [bucket, key]
+    )) {
+        Result.Ok(rows) => if (rows.len() == 0) {
+            Option.None
+        } else {
+            Option.Some(object_of(rows[0]))
+        },
+        Result.Err(_) => Option.None,
+    }
+}
+
+fn object_params(o: Object) -> [string] {
+    [
+        o.bucket,
+        o.key,
+        o.blob,
+        to_string(o.size),
+        o.etag,
+        o.content_type,
+        o.meta,
+        o.acl,
+        to_string(o.mtime_ms)
+    ]
+}
+
+// Inserts or replaces the object; the blob it replaced is freed.
+fn upsert(c: sqlite.Conn, o: Object) -> Result<Freed, string> {
+    let freed: Freed = match (head(c, o.bucket, o.key)) {
+        Option.Some(old) => [old.blob],
+        Option.None => [],
+    };
+    sqlite.exec(
+        c,
+        "INSERT OR REPLACE INTO objects (${OBJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        object_params(o)
+    )?;
+    Result.Ok(freed)
+}
+
+fn put(c: sqlite.Conn, o: Object) -> Result<Freed, string> {
+    if (!has_bucket(c, o.bucket)) {
+        return Result.Err("NoSuchBucket");
+    }
+    upsert(c, o)
+}
+
+fn delete(c: sqlite.Conn, bucket: string, key: string) -> Result<Freed, string> {
+    if (!has_bucket(c, bucket)) {
+        return Result.Err("NoSuchBucket");
+    }
+    match (head(c, bucket, key)) {
+        Option.Some(old) => {
+            sqlite.exec(c, "DELETE FROM objects WHERE bucket = ?1 AND key = ?2", [bucket, key])?;
+            Result.Ok([old.blob])
+        },
+        Option.None => Result.Ok([]),
+    }
+}
+
+fn set_acl(c: sqlite.Conn, bucket: string, key: string, acl: string) -> Result<int, string> {
+    let n = sqlite.exec(
+        c,
+        "UPDATE objects SET acl = ?3 WHERE bucket = ?1 AND key = ?2",
+        [bucket, key, acl]
+    )?;
+    if (n == 0) {
+        Result.Err("NoSuchKey")
+    } else {
+        Result.Ok(n)
+    }
+}
+
+/// The smallest string greater than every string that starts with `p` (in byte order, which
+/// is SQLite's and S3's order): `p` with its last character bumped by one code point.
+pub fn past_prefix(p: string) -> string {
+    let last = p[p.len() - 1];
+    p.substring(0, p.len() - 1) + to_string(char_from_code(char_code(last) + 1).unwrap_or(last))
+}
+
+/// A page of keys under `prefix`, keys that share a segment up to `delimiter` rolled into one
+/// common prefix. Both count against `max_keys`, as in S3.
+fn list(c: sqlite.Conn, q: Query) -> Result<Listing, string> {
+    if (!has_bucket(c, q.bucket)) {
+        return Result.Err("NoSuchBucket");
+    }
+    var objects: [Object] = [];
+    var prefixes: [string] = [];
+    // Resume strictly after `after`; if it is a common prefix, past everything under it.
+    var after = q.after;
+    var floor = q.prefix;
+    if (q.delimiter != ""
+        && after != ""
+        && after.ends_with(q.delimiter)
+        && after.starts_with(q.prefix)) {
+        floor = past_prefix(after);
+        after = "";
+    }
+    if (floor < q.prefix) {
+        floor = q.prefix;
+    }
+    var last = "";
+    let batch = q.max_keys + 1;
+    while (true) {
+        let rows = sqlite.query(
+            c,
+            "SELECT ${OBJECT_COLS} FROM objects WHERE bucket = ?1 AND key > ?2 AND key >= ?3 ORDER BY key LIMIT ?4",
+            [q.bucket, after, floor, to_string(batch)]
+        )?;
+        if (rows.len() == 0) {
+            return Result.Ok(
+                Listing { objects: objects, prefixes: prefixes, truncated: false, next: "" }
+            );
+        }
+        var jumped = false;
+        for r in rows {
+            let key = r[1];
+            if (!key.starts_with(q.prefix)) {
+                return Result.Ok(
+                    Listing { objects: objects, prefixes: prefixes, truncated: false, next: "" }
+                );
+            }
+            if (objects.len() + prefixes.len() == q.max_keys) {
+                return Result.Ok(
+                    Listing { objects: objects, prefixes: prefixes, truncated: true, next: last }
+                );
+            }
+            let rest = key.substring(q.prefix.len(), key.len());
+            let cut = if (q.delimiter == "") { Option.None } else { rest.index_of(q.delimiter) };
+            match (cut) {
+                Option.Some(i) => {
+                    let cp = q.prefix + rest.substring(0, i + q.delimiter.len());
+                    prefixes.push(cp);
+                    last = cp;
+                    // Skip the rest of this prefix with a fresh query.
+                    floor = past_prefix(cp);
+                    after = "";
+                    jumped = true;
+                    break;
+                },
+                Option.None => {
+                    objects.push(object_of(r));
+                    last = key;
+                    after = key;
+                },
+            }
+        }
+        if (!jumped && rows.len() < batch) {
+            return Result.Ok(
+                Listing { objects: objects, prefixes: prefixes, truncated: false, next: "" }
+            );
+        }
+    }
+}
+
+fn create_upload(c: sqlite.Conn, u: Upload) -> Result<int, string> {
+    if (!has_bucket(c, u.bucket)) {
+        return Result.Err("NoSuchBucket");
+    }
+    sqlite.exec(
+        c,
+        "INSERT INTO uploads (id, bucket, key, content_type, meta, acl, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        [u.id, u.bucket, u.key, u.content_type, u.meta, u.acl, to_string(u.created_ms)]
+    )
+}
+
+fn get_upload(c: sqlite.Conn, id: string) -> Option<Upload> {
+    let rows = match (sqlite.query(
+        c,
+        "SELECT id, bucket, key, content_type, meta, acl, created_ms FROM uploads WHERE id = ?1",
+        [id]
+    )) {
+        Result.Ok(rows) => rows,
+        Result.Err(_) => return Option.None,
+    };
+    if (rows.len() == 0) {
+        return Option.None;
+    }
+    let r = rows[0];
+    Option.Some(
+        Upload {
+            id: r[0],
+            bucket: r[1],
+            key: r[2],
+            content_type: r[3],
+            meta: r[4],
+            acl: r[5],
+            created_ms: num(r[6])
+        }
+    )
+}
+
+fn put_part(c: sqlite.Conn, id: string, p: Part) -> Result<Freed, string> {
+    if (get_upload(c, id).is_none()) {
+        return Result.Err("NoSuchUpload");
+    }
+    let old = sqlite.query(
+        c,
+        "SELECT blob FROM parts WHERE upload = ?1 AND number = ?2",
+        [id, to_string(p.number)]
+    )?;
+    sqlite.exec(
+        c,
+        "INSERT OR REPLACE INTO parts (upload, number, blob, size, etag) VALUES (?1, ?2, ?3, ?4, ?5)",
+        [id, to_string(p.number), p.blob, to_string(p.size), p.etag]
+    )?;
+    Result.Ok(old.map(fn(r: [string]) -> string { r[0] }))
+}
+
+fn parts(c: sqlite.Conn, id: string) -> [Part] {
+    match (sqlite.query(
+        c,
+        "SELECT number, blob, size, etag FROM parts WHERE upload = ?1 ORDER BY number",
+        [id]
+    )) {
+        Result.Ok(rows) => rows.map(fn(r: [string]) -> Part {
+            Part { number: num(r[0]), blob: r[1], size: num(r[2]), etag: r[3] }
+        }),
+        Result.Err(_) => [],
+    }
+}
+
+// One transaction: the object appears and the upload disappears together. The parts' blobs
+// are freed (the object has its own, joined from them).
+fn complete(c: sqlite.Conn, id: string, o: Object) -> Result<Freed, string> {
+    if (get_upload(c, id).is_none()) {
+        return Result.Err("NoSuchUpload");
+    }
+    var freed: Freed = parts(c, id).map(fn(p: Part) -> string { p.blob });
+    sqlite.exec(c, "BEGIN", [])?;
+    let r = finish(c, id, o);
+    match (r) {
+        Result.Ok(old) => {
+            sqlite.exec(c, "COMMIT", [])?;
+            Result.Ok(freed + old)
+        },
+        Result.Err(e) => {
+            sqlite.exec(c, "ROLLBACK", []);
+            Result.Err(e)
+        },
+    }
+}
+
+fn finish(c: sqlite.Conn, id: string, o: Object) -> Result<Freed, string> {
+    let old = put(c, o)?;
+    sqlite.exec(c, "DELETE FROM parts WHERE upload = ?1", [id])?;
+    sqlite.exec(c, "DELETE FROM uploads WHERE id = ?1", [id])?;
+    Result.Ok(old)
+}
+
+fn abort(c: sqlite.Conn, id: string) -> Result<Freed, string> {
+    if (get_upload(c, id).is_none()) {
+        return Result.Err("NoSuchUpload");
+    }
+    let freed: Freed = parts(c, id).map(fn(p: Part) -> string { p.blob });
+    sqlite.exec(c, "DELETE FROM parts WHERE upload = ?1", [id])?;
+    sqlite.exec(c, "DELETE FROM uploads WHERE id = ?1", [id])?;
+    Result.Ok(freed)
+}
+
+// --- The client side: one call per message, for the handlers. ---
+
+pub fn ask_buckets(ix: Channel<Msg>) -> [Bucket] {
+    let r: Channel<[Bucket]> = Channel.bounded(1);
+    send(ix, Msg.Buckets(r));
+    recv(r).unwrap_or([])
+}
+
+pub fn ask_has_bucket(ix: Channel<Msg>, name: string) -> bool {
+    let r: Channel<bool> = Channel.bounded(1);
+    send(ix, Msg.HasBucket(name, r));
+    recv(r).unwrap_or(false)
+}
+
+fn wait_int(r: Channel<Result<int, string>>) -> Result<int, string> {
+    recv(r).unwrap_or(Result.Err("InternalError"))
+}
+
+fn wait_freed(r: Channel<Result<Freed, string>>) -> Result<Freed, string> {
+    recv(r).unwrap_or(Result.Err("InternalError"))
+}
+
+pub fn ask_create_bucket(ix: Channel<Msg>, name: string, now: int) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(ix, Msg.CreateBucket(name, now, r));
+    wait_int(r)
+}
+
+pub fn ask_delete_bucket(ix: Channel<Msg>, name: string) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(ix, Msg.DeleteBucket(name, r));
+    wait_int(r)
+}
+
+pub fn ask_head(ix: Channel<Msg>, bucket: string, key: string) -> Option<Object> {
+    let r: Channel<Option<Object>> = Channel.bounded(1);
+    send(ix, Msg.Head(bucket, key, r));
+    match (recv(r)) {
+        Option.Some(o) => o,
+        Option.None => Option.None,
+    }
+}
+
+pub fn ask_put(ix: Channel<Msg>, o: Object) -> Result<Freed, string> {
+    let r: Channel<Result<Freed, string>> = Channel.bounded(1);
+    send(ix, Msg.Put(o, r));
+    wait_freed(r)
+}
+
+pub fn ask_delete(ix: Channel<Msg>, bucket: string, key: string) -> Result<Freed, string> {
+    let r: Channel<Result<Freed, string>> = Channel.bounded(1);
+    send(ix, Msg.Delete(bucket, key, r));
+    wait_freed(r)
+}
+
+pub fn ask_set_acl(
+    ix: Channel<Msg>,
+    bucket: string,
+    key: string,
+    acl: string
+) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(ix, Msg.SetAcl(bucket, key, acl, r));
+    wait_int(r)
+}
+
+pub fn ask_list(ix: Channel<Msg>, q: Query) -> Result<Listing, string> {
+    let r: Channel<Result<Listing, string>> = Channel.bounded(1);
+    send(ix, Msg.List(q, r));
+    recv(r).unwrap_or(Result.Err("InternalError"))
+}
+
+pub fn ask_create_upload(ix: Channel<Msg>, u: Upload) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(ix, Msg.CreateUpload(u, r));
+    wait_int(r)
+}
+
+pub fn ask_upload(ix: Channel<Msg>, id: string) -> Option<Upload> {
+    let r: Channel<Option<Upload>> = Channel.bounded(1);
+    send(ix, Msg.GetUpload(id, r));
+    match (recv(r)) {
+        Option.Some(u) => u,
+        Option.None => Option.None,
+    }
+}
+
+pub fn ask_put_part(ix: Channel<Msg>, id: string, p: Part) -> Result<Freed, string> {
+    let r: Channel<Result<Freed, string>> = Channel.bounded(1);
+    send(ix, Msg.PutPart(id, p, r));
+    wait_freed(r)
+}
+
+pub fn ask_parts(ix: Channel<Msg>, id: string) -> [Part] {
+    let r: Channel<[Part]> = Channel.bounded(1);
+    send(ix, Msg.Parts(id, r));
+    recv(r).unwrap_or([])
+}
+
+pub fn ask_complete(ix: Channel<Msg>, id: string, o: Object) -> Result<Freed, string> {
+    let r: Channel<Result<Freed, string>> = Channel.bounded(1);
+    send(ix, Msg.Complete(id, o, r));
+    wait_freed(r)
+}
+
+pub fn ask_abort(ix: Channel<Msg>, id: string) -> Result<Freed, string> {
+    let r: Channel<Result<Freed, string>> = Channel.bounded(1);
+    send(ix, Msg.Abort(id, r));
+    wait_freed(r)
+}
+
+pub fn stop(ix: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(ix, Msg.Stop(r));
+    recv(r);
+}

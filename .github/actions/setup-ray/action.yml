@@ -1,0 +1,80 @@
+# Sets up what rayblob needs to test and build on any runner: Rust stable with the
+# target's std (for `--native`), the raylang release pinned in ray.toml
+# (`raylang = "X.Y.Z"`, prebuilt from ray-language/raylang's Releases, checked against
+# `ray version`) on PATH, and a cache of the ray-runtime crates the native build fetches.
+# Every step runs under bash (Git Bash on Windows). Used by ci.yml.
+name: Set up raylang
+description: Install Rust and the raylang release pinned in ray.toml
+inputs:
+  target:
+    description: The runner's own Rust target triple (e.g. aarch64-apple-darwin)
+    required: true
+outputs:
+  version:
+    description: The raylang version installed
+    value: ${{ steps.raylang.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Install Rust stable + target
+      shell: bash
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          # Not every Windows ARM image ships rustup.
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/rustup-init.exe" https://win.rustup.rs/aarch64
+          "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal --default-toolchain none
+          echo "$USERPROFILE/.cargo/bin" >>"$GITHUB_PATH"
+          export PATH="$USERPROFILE/.cargo/bin:$PATH"
+        fi
+        rustup toolchain install stable --profile minimal
+        rustup default stable
+        rustup target add ${{ inputs.target }}
+
+    - name: Install the pinned raylang release
+      id: raylang
+      shell: bash
+      run: |
+        version="$(sed -n 's/^raylang *= *"\(.*\)"/\1/p' ray.toml | head -1)"
+        if [ -z "$version" ]; then
+          echo "::error::ray.toml does not pin a raylang version"
+          exit 1
+        fi
+        # raylang ships a .zip for Windows and a .tar.gz everywhere else.
+        case "${{ inputs.target }}" in
+          *-windows-*) ext=zip ;;
+          *) ext=tar.gz ;;
+        esac
+        url="https://github.com/ray-language/raylang/releases/download/v$version/raylang-${{ inputs.target }}.$ext"
+        echo "raylang $version from $url"
+        dir="$RUNNER_TEMP/raylang"
+        mkdir -p "$dir"
+        if [ "$ext" = "zip" ]; then
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/raylang.zip" "$url"
+          powershell -NoProfile -Command "Expand-Archive -Path '$RUNNER_TEMP/raylang.zip' -DestinationPath '$dir'"
+        else
+          curl -sSfL --retry 3 "$url" | tar xz -C "$dir"
+        fi
+        if ! "$dir/ray" version | tr -d '\r' | grep -qxF "raylang $version"; then
+          echo "::error::downloaded ray reports '$("$dir/ray" version | head -1)', expected raylang $version"
+          exit 1
+        fi
+        echo "$dir" >>"$GITHUB_PATH"
+        echo "version=$version" >>"$GITHUB_OUTPUT"
+
+    # The native build compiles the ray-runtime crates; cache them per raylang release.
+    - name: Cache the native build's crates
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ray-native-${{ inputs.target }}-${{ steps.raylang.outputs.version }}
+        restore-keys: ray-native-${{ inputs.target }}-
+
+    # Informational: it exits 1 when anything optional (extra targets, the offline
+    # vendor) is missing, which the native build does not need.
+    - name: ray toolchain status
+      shell: bash
+      run: |
+        ray version
+        ray toolchain status || true

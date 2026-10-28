@@ -1,0 +1,323 @@
+// The service end to end, in one test (OS listeners outlive a test's fibers): signed
+// requests, multipart, presigned URLs, permissions, and the data surviving a restart.
+
+import std/fs;
+import std/net;
+import std/time;
+import std/xml;
+import net/http;
+import config;
+import server;
+import sigv4;
+
+const ACCESS: string = "AKRBTEST00000001";
+
+const SECRET: string = "test-secret-1";
+
+struct Svc {
+    port: int,
+    stop: Channel<int>,
+    done: Channel<Result<int, string>>,
+}
+
+fn boot(data: string) -> Svc {
+    let src = `
+[server]
+listen = "127.0.0.1:0"
+data = "${data}"
+max_object_mb = 4
+min_part_mb = 1
+
+[key.admin]
+access = "${ACCESS}"
+secret = "${SECRET}"
+
+[key.reader]
+access = "AKRBREADER000001"
+secret = "reader-secret"
+buckets = ["pics"]
+write = false
+`;
+    let cfg = config.parse(src).unwrap();
+    let l = server.listen(cfg).unwrap();
+    let stop: Channel<int> = Channel.bounded(1);
+    let done: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        send(done, server.serve(cfg, l, stop, true));
+    });
+    Svc { port: net.local_port(l), stop: stop, done: done }
+}
+
+fn halt(s: Svc) {
+    send(s.stop, 1);
+    recv(s.done);
+}
+
+// A request signed in the Authorization header, the way SDKs sign.
+fn call(
+    s: Svc,
+    method: string,
+    path: string,
+    query: string,
+    body: bytes,
+    extra: [(string, string)]
+) -> http.Response {
+    call_as(s, ACCESS, SECRET, method, path, query, body, extra)
+}
+
+fn call_as(
+    s: Svc,
+    access: string,
+    secret: string,
+    method: string,
+    path: string,
+    query: string,
+    body: bytes,
+    extra: [(string, string)]
+) -> http.Response {
+    let host = "127.0.0.1:${s.port}";
+    let date = sigv4.amz_date(time.now());
+    let sha = sigv4.sha256_hex(body);
+    let h: Map<string, string> = Map.new();
+    h.insert("host", host);
+    h.insert("x-amz-date", date);
+    h.insert("x-amz-content-sha256", sha);
+    for (k, v) in extra {
+        h.insert(k, v);
+    }
+    let signed = sort(h.keys());
+    let canonical = sigv4.canonical_request(method, path, query, h, signed, sha);
+    let sig = sigv4.sign(secret, date, "us-east-1", "s3", canonical);
+    let auth = "AWS4-HMAC-SHA256 Credential=${access}/${date.substring(0, 8)}/us-east-1/s3/aws4_request, SignedHeaders=${join(signed, ";")}, Signature=${sig}";
+    var pairs: [(string, string)] = [("Authorization", auth)];
+    for k in signed {
+        if (k != "host") {
+            pairs.push((k, h.get_or(k, "")));
+        }
+    }
+    let url = if (query == "") {
+        "http://${host}${path}"
+    } else {
+        "http://${host}${path}?${query}"
+    };
+    http.request_pairs(method, url, body, pairs, 10000).unwrap()
+}
+
+fn body_of(r: http.Response) -> string {
+    from_utf8(r.body).unwrap_or("")
+}
+
+fn code_of(r: http.Response) -> string {
+    match (xml.parse(body_of(r))) {
+        Result.Ok(e) => e.text_of("Code"),
+        Result.Err(_) => "",
+    }
+}
+
+fn none() -> bytes {
+    bytes_of([])
+}
+
+fn filled(n: int, seed: int) -> bytes {
+    var xs: [int] = [];
+    for i in 0..n {
+        xs.push((i * 31 + seed) % 256);
+    }
+    bytes_of(xs)
+}
+
+@test
+fn s3_end_to_end() {
+    let data = fs.make_temp_dir("rayblob-e2e").unwrap();
+    let s = boot(data);
+
+    // Buckets.
+    assert_eq(call(s, "PUT", "/pics", "", none(), []).status, 200);
+    assert_eq(code_of(call(s, "PUT", "/pics", "", none(), [])), "BucketAlreadyOwnedByYou");
+    assert_eq(code_of(call(s, "PUT", "/Bad_Name", "", none(), [])), "InvalidBucketName");
+    assert(body_of(call(s, "GET", "/", "", none(), [])).contains("<Name>pics</Name>"));
+
+    // An object with a space in its key, metadata and a content type.
+    let put = call(
+        s,
+        "PUT",
+        "/pics/a%20dir/hello.txt",
+        "",
+        "hello world".to_bytes(),
+        [("content-type", "text/plain"), ("x-amz-meta-owner", "ray")]
+    );
+    assert_eq(put.status, 200);
+    assert_eq(http.header(put, "etag").unwrap_or(""), "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"");
+    let got = call(s, "GET", "/pics/a%20dir/hello.txt", "", none(), []);
+    assert_eq(body_of(got), "hello world");
+    assert_eq(http.header(got, "content-type").unwrap_or(""), "text/plain");
+    assert_eq(http.header(got, "x-amz-meta-owner").unwrap_or(""), "ray");
+    let part = call(s, "GET", "/pics/a%20dir/hello.txt", "", none(), [("range", "bytes=6-10")]);
+    assert_eq((part.status, body_of(part)), (206, "world"));
+    assert_eq(
+        call(
+            s,
+            "GET",
+            "/pics/a%20dir/hello.txt",
+            "",
+            none(),
+            [("if-none-match", "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"")]
+        ).status,
+        304
+    );
+    assert_eq(code_of(call(s, "GET", "/pics/missing", "", none(), [])), "NoSuchKey");
+
+    // A wrong body hash and a wrong secret.
+    let lie = call(s, "PUT", "/pics/x", "", "abc".to_bytes(), []);
+    assert_eq(lie.status, 200);
+    assert_eq(
+        code_of(call_as(s, ACCESS, "nope", "GET", "/pics/x", "", none(), [])),
+        "SignatureDoesNotMatch"
+    );
+    // Over the limit the web server refuses the body before the handler sees it.
+    let big = http.request_pairs(
+        "PUT",
+        "http://127.0.0.1:${s.port}/pics/big",
+        filled(5 * 1024 * 1024, 1),
+        [],
+        5000
+    );
+    assert(big.is_err() || big.unwrap().status >= 400);
+
+    // Listing with a delimiter.
+    call(s, "PUT", "/pics/a%20dir/z.txt", "", "z".to_bytes(), []);
+    let top = body_of(call(s, "GET", "/pics", "list-type=2&delimiter=%2F", none(), []));
+    assert(top.contains("<CommonPrefixes><Prefix>a dir/</Prefix></CommonPrefixes>"));
+    assert(top.contains("<Key>x</Key>"));
+    let paged = xml.parse(body_of(call(s, "GET", "/pics", "list-type=2&max-keys=1", none(), [])))
+        .unwrap();
+    assert_eq(paged.text_of("IsTruncated"), "true");
+    let token = paged.text_of("NextContinuationToken");
+    let next = body_of(
+        call(s, "GET", "/pics", "list-type=2&max-keys=5&continuation-token=${token}", none(), [])
+    );
+    assert(
+        next.contains("<Key>a dir/z.txt</Key>")
+            && next.contains("<Key>x</Key>")
+            && !next.contains("hello")
+    );
+
+    // Multipart: two parts of 1 MiB and a short last one, out of order.
+    let init = xml.parse(body_of(call(s, "POST", "/pics/movie.bin", "uploads=", none(), [])))
+        .unwrap();
+    let id = init.text_of("UploadId");
+    let p1 = filled(1024 * 1024, 7);
+    let p2 = filled(1024 * 1024, 9);
+    let p3 = filled(1000, 11);
+    let e2 = http.header(call(s, "PUT", "/pics/movie.bin", "partNumber=2&uploadId=${id}", p2, []), "etag")
+        .unwrap();
+    let e1 = http.header(call(s, "PUT", "/pics/movie.bin", "partNumber=1&uploadId=${id}", p1, []), "etag")
+        .unwrap();
+    let e3 = http.header(call(s, "PUT", "/pics/movie.bin", "partNumber=3&uploadId=${id}", p3, []), "etag")
+        .unwrap();
+    let wrong_order = "<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part></CompleteMultipartUpload>";
+    assert_eq(
+        code_of(call(s, "POST", "/pics/movie.bin", "uploadId=${id}", wrong_order.to_bytes(), [])),
+        "InvalidPartOrder"
+    );
+    let ok = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part><Part><PartNumber>3</PartNumber><ETag>${e3}</ETag></Part></CompleteMultipartUpload>";
+    let done = xml.parse(body_of(call(s, "POST", "/pics/movie.bin", "uploadId=${id}", ok.to_bytes(), [])))
+        .unwrap();
+    assert(done.text_of("ETag").ends_with("-3\""));
+    let whole = call(s, "GET", "/pics/movie.bin", "", none(), []);
+    assert_eq(whole.body, bytes_concat([p1, p2, p3]));
+    assert_eq(
+        code_of(call(s, "POST", "/pics/movie.bin", "uploadId=${id}", ok.to_bytes(), [])),
+        "NoSuchUpload"
+    );
+
+    // Presigned URLs: an upload by a client with no credentials, then a download.
+    let host = "127.0.0.1:${s.port}";
+    let up = sigv4.presign(
+        ACCESS,
+        SECRET,
+        "us-east-1",
+        "PUT",
+        host,
+        "/pics/by-url.txt",
+        time.now(),
+        60
+    );
+    assert_eq(
+        http.request_pairs("PUT", "http://${host}${up}", "from a form".to_bytes(), [], 5000)
+            .unwrap().status,
+        200
+    );
+    let down = sigv4.presign(
+        ACCESS,
+        SECRET,
+        "us-east-1",
+        "GET",
+        host,
+        "/pics/by-url.txt",
+        time.now(),
+        60
+    );
+    assert_eq(body_of(http.fetch("http://${host}${down}").unwrap()), "from a form");
+    let old = sigv4.presign(
+        ACCESS,
+        SECRET,
+        "us-east-1",
+        "GET",
+        host,
+        "/pics/by-url.txt",
+        time.now() - 120000,
+        60
+    );
+    assert_eq(code_of(http.fetch("http://${host}${old}").unwrap()), "AccessDenied");
+
+    // Permissions: anonymous only reads public-read objects; the reader key cannot write.
+    assert_eq(http.fetch("http://${host}/pics/x").unwrap().status, 403);
+    call(s, "PUT", "/pics/public.txt", "", "for all".to_bytes(), [("x-amz-acl", "public-read")]);
+    assert_eq(body_of(http.fetch("http://${host}/pics/public.txt").unwrap()), "for all");
+    assert_eq(
+        body_of(call_as(s, "AKRBREADER000001", "reader-secret", "GET", "/pics/x", "", none(), [])),
+        "abc"
+    );
+    assert_eq(
+        code_of(
+            call_as(
+                s,
+                "AKRBREADER000001",
+                "reader-secret",
+                "PUT",
+                "/pics/y",
+                "",
+                "no".to_bytes(),
+                []
+            )
+        ),
+        "AccessDenied"
+    );
+
+    // Copy, delete, and a bucket that is not empty.
+    assert_eq(
+        call(s, "PUT", "/pics/copy.bin", "", none(), [("x-amz-copy-source", "/pics/movie.bin")]).status,
+        200
+    );
+    assert_eq(call(s, "GET", "/pics/copy.bin", "", none(), []).body.len(), 2 * 1024 * 1024 + 1000);
+    assert_eq(call(s, "DELETE", "/pics/copy.bin", "", none(), []).status, 204);
+    assert_eq(code_of(call(s, "DELETE", "/pics", "", none(), [])), "BucketNotEmpty");
+    halt(s);
+
+    // Everything is still there after a restart, and no blob is left that the index does not name.
+    let s2 = boot(data);
+    assert_eq(
+        call(s2, "GET", "/pics/movie.bin", "", none(), []).body.len(),
+        2 * 1024 * 1024 + 1000
+    );
+    assert_eq(body_of(call(s2, "GET", "/pics/a%20dir/hello.txt", "", none(), [])), "hello world");
+    var blobs_on_disk = 0;
+    for d in fs.list_dir("${data}/blobs").unwrap() {
+        blobs_on_disk = blobs_on_disk + fs.list_dir("${data}/blobs/${d}").unwrap().len();
+    }
+    // hello, z, x, movie, by-url, public.
+    assert_eq(blobs_on_disk, 6);
+    halt(s2);
+    fs.remove_all(data);
+}

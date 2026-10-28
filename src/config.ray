@@ -1,0 +1,148 @@
+//! `rayblob.toml`: where to listen, where the data lives, and the access keys.
+//!
+//! ```toml
+//! [server]
+//! listen = "127.0.0.1:9300"
+//! data = "data"
+//! region = "us-east-1"
+//! max_object_mb = 64      # one PUT or one part; larger objects go multipart
+//!
+//! [key.admin]
+//! access = "AKRAYBLOBADMIN000000"
+//! secret = "…"
+//! buckets = ["*"]         # bucket names, or "*" for all
+//! write = true
+//! ```
+
+import std/fs;
+import std/toml;
+
+pub struct Key {
+    name: string,
+    access: string,
+    secret: string,
+    buckets: [string],
+    write: bool,
+}
+
+pub struct Config {
+    host: string,
+    port: int,
+    data: string,
+    region: string,
+    max_object: int,
+    /// The smallest part a multipart upload may have, but for the last (S3: 5 MiB).
+    min_part: int,
+    keys: [Key],
+}
+
+pub fn defaults() -> Config {
+    Config {
+        host: "127.0.0.1",
+        port: 9300,
+        data: "data",
+        region: "us-east-1",
+        max_object: 64 * 1024 * 1024,
+        min_part: 5 * 1024 * 1024,
+        keys: []
+    }
+}
+
+pub fn load(path: string) -> Result<Config, string> {
+    parse(fs.read_file(path)?)
+}
+
+fn str_of(entries: [toml.TomlEntry], key: string, default: string) -> Result<string, string> {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(toml.TomlValue.TStr(s)) => Result.Ok(s),
+        Option.Some(_) => Result.Err("${key} must be a string"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+fn int_of(entries: [toml.TomlEntry], key: string, default: int) -> Result<int, string> {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(toml.TomlValue.TInt(n)) => Result.Ok(n),
+        Option.Some(_) => Result.Err("${key} must be an integer"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+pub fn parse(src: string) -> Result<Config, string> {
+    let entries = toml.parse_toml(src)?;
+    var c = defaults();
+    let listen = str_of(entries, "server.listen", "${c.host}:${c.port}")?;
+    match (listen.last_index_of(":")) {
+        Option.Some(i) => {
+            c.host = listen.substring(0, i);
+            c.port = match (parse_int(listen.substring(i + 1, listen.len()))) {
+                Option.Some(p) => p,
+                Option.None => return Result.Err("server.listen: bad port in '${listen}'"),
+            };
+        },
+        Option.None => return Result.Err("server.listen must be HOST:PORT"),
+    }
+    c.data = str_of(entries, "server.data", c.data)?;
+    c.region = str_of(entries, "server.region", c.region)?;
+    c.max_object = int_of(entries, "server.max_object_mb", 64)? * 1024 * 1024;
+    c.min_part = int_of(entries, "server.min_part_mb", 5)? * 1024 * 1024;
+    // [key.NAME] tables arrive flattened as key.NAME.field.
+    var names: [string] = [];
+    for e in entries {
+        if (e.key.starts_with("key.")) {
+            let rest = e.key.substring(4, e.key.len());
+            match (rest.index_of(".")) {
+                Option.Some(i) => {
+                    let n = rest.substring(0, i);
+                    if (!names.contains(n)) {
+                        names.push(n);
+                    }
+                },
+                Option.None => { },
+            }
+        }
+    }
+    for n in names {
+        let p = "key.${n}";
+        let access = str_of(entries, "${p}.access", "")?;
+        let secret = str_of(entries, "${p}.secret", "")?;
+        if (access == "" || secret == "") {
+            return Result.Err("[${p}] needs access and secret");
+        }
+        var buckets: [string] = [];
+        match (toml.toml_get(entries, "${p}.buckets")) {
+            Option.Some(toml.TomlValue.TArray(items)) => {
+                for it in items {
+                    match (it) {
+                        toml.TomlValue.TStr(s) => buckets.push(s),
+                        _ => return Result.Err("${p}.buckets must hold strings"),
+                    }
+                }
+            },
+            Option.Some(_) => return Result.Err("${p}.buckets must be an array"),
+            Option.None => buckets.push("*"),
+        }
+        let write = match (toml.toml_get(entries, "${p}.write")) {
+            Option.Some(toml.TomlValue.TBool(b)) => b,
+            Option.Some(_) => return Result.Err("${p}.write must be true or false"),
+            Option.None => true,
+        };
+        c.keys.push(
+            Key { name: n, access: access, secret: secret, buckets: buckets, write: write }
+        );
+    }
+    Result.Ok(c)
+}
+
+pub fn find_key(c: Config, access: string) -> Option<Key> {
+    for k in c.keys {
+        if (k.access == access) {
+            return Option.Some(k);
+        }
+    }
+    Option.None
+}
+
+pub fn allows(k: Key, bucket: string) -> bool {
+    k.buckets.contains("*") || k.buckets.contains(bucket)
+}

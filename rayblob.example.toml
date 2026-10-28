@@ -1,0 +1,24 @@
+# rayblob configuration. Copy to rayblob.toml and put real keys in it (`rayblob keygen NAME`).
+
+[server]
+listen = "127.0.0.1:9300"
+data = "data"
+region = "us-east-1"
+# The largest body of one request (PUT or one part); bigger objects go multipart.
+max_object_mb = 64
+# The smallest part of a multipart upload but the last (S3: 5).
+min_part_mb = 5
+
+# Full access to every bucket.
+[key.admin]
+access = "AKRBCHANGEME00000"
+secret = "change-me"
+buckets = ["*"]
+write = true
+
+# Read-only on one bucket.
+[key.reader]
+access = "AKRBREADER0000000"
+secret = "change-me-too"
+buckets = ["public"]
+write = false

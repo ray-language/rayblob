@@ -1,0 +1,149 @@
+// The index on its own: buckets, overwrites that free the old blob, listings with prefixes,
+// delimiters and pages, multipart bookkeeping, and the orphan sweep at start.
+
+import std/fs;
+import blobs;
+import index;
+
+fn fresh() -> (string, Channel<index.Msg>) {
+    let root = fs.make_temp_dir("rayblob-ix").unwrap();
+    let ix = index.start(root).unwrap();
+    (root, ix)
+}
+
+fn obj(bucket: string, key: string, blob: string) -> index.Object {
+    index.Object {
+        bucket: bucket,
+        key: key,
+        blob: blob,
+        size: 1,
+        etag: "e",
+        content_type: "text/plain",
+        meta: "",
+        acl: "private",
+        mtime_ms: 1
+    }
+}
+
+fn q(prefix: string, delimiter: string, after: string, max: int) -> index.Query {
+    index.Query { bucket: "b", prefix: prefix, delimiter: delimiter, after: after, max_keys: max }
+}
+
+fn keys(l: index.Listing) -> string {
+    join(l.objects.map(fn(o: index.Object) -> string { o.key }), ",")
+}
+
+@test
+fn buckets_and_overwrites() {
+    let (root, ix) = fresh();
+    assert(index.ask_create_bucket(ix, "b", 5).is_ok());
+    assert_eq(index.ask_create_bucket(ix, "b", 6), Result.Err("BucketAlreadyOwnedByYou"));
+    assert_eq(index.ask_put(ix, obj("nope", "k", "x")), Result.Err("NoSuchBucket"));
+    assert_eq(index.ask_put(ix, obj("b", "k", "blob1")), Result.Ok([]));
+    assert_eq(index.ask_put(ix, obj("b", "k", "blob2")), Result.Ok(["blob1"]));
+    assert_eq(index.ask_head(ix, "b", "k").unwrap().blob, "blob2");
+    assert_eq(index.ask_delete_bucket(ix, "b"), Result.Err("BucketNotEmpty"));
+    assert_eq(index.ask_delete(ix, "b", "k"), Result.Ok(["blob2"]));
+    assert_eq(index.ask_delete(ix, "b", "k"), Result.Ok([]));
+    assert(index.ask_delete_bucket(ix, "b").is_ok());
+    assert_eq(index.ask_buckets(ix).len(), 0);
+    index.stop(ix);
+    fs.remove_all(root);
+}
+
+@test
+fn listings() {
+    let (root, ix) = fresh();
+    index.ask_create_bucket(ix, "b", 1);
+    for k in ["a.txt", "docs/a", "docs/b", "docs/sub/c", "docs0", "img/x.png", "img/y.png", "z"] {
+        index.ask_put(ix, obj("b", k, k));
+    }
+    let all = index.ask_list(ix, q("", "", "", 1000)).unwrap();
+    assert_eq(keys(all), "a.txt,docs/a,docs/b,docs/sub/c,docs0,img/x.png,img/y.png,z");
+    assert(!all.truncated);
+
+    let top = index.ask_list(ix, q("", "/", "", 1000)).unwrap();
+    assert_eq(keys(top), "a.txt,docs0,z");
+    assert_eq(join(top.prefixes, ","), "docs/,img/");
+
+    let docs = index.ask_list(ix, q("docs/", "/", "", 1000)).unwrap();
+    assert_eq(keys(docs), "docs/a,docs/b");
+    assert_eq(join(docs.prefixes, ","), "docs/sub/");
+
+    // Pages of two, prefixes counting as keys, resumed from `next`.
+    var after = "";
+    var seen: [string] = [];
+    var pages = 0;
+    while (true) {
+        let p = index.ask_list(ix, q("", "/", after, 2)).unwrap();
+        pages = pages + 1;
+        seen = seen + p.objects.map(fn(o: index.Object) -> string { o.key }) + p.prefixes;
+        if (!p.truncated) {
+            break;
+        }
+        after = p.next;
+    }
+    assert_eq(join(sort(seen), ","), "a.txt,docs/,docs0,img/,z");
+    assert_eq(pages, 3);
+    index.stop(ix);
+    fs.remove_all(root);
+}
+
+@test
+fn multipart_bookkeeping() {
+    let (root, ix) = fresh();
+    index.ask_create_bucket(ix, "b", 1);
+    let u = index.Upload {
+        id: "u1",
+        bucket: "b",
+        key: "big",
+        content_type: "",
+        meta: "",
+        acl: "private",
+        created_ms: 1
+    };
+    assert(index.ask_create_upload(ix, u).is_ok());
+    assert_eq(
+        index.ask_put_part(ix, "u1", index.Part { number: 2, blob: "p2", size: 1, etag: "e2" }),
+        Result.Ok([])
+    );
+    assert_eq(
+        index.ask_put_part(ix, "u1", index.Part { number: 1, blob: "p1", size: 1, etag: "e1" }),
+        Result.Ok([])
+    );
+    assert_eq(
+        index.ask_put_part(ix, "u1", index.Part { number: 1, blob: "p1b", size: 1, etag: "e1" }),
+        Result.Ok(["p1"])
+    );
+    assert_eq(index.ask_parts(ix, "u1").map(fn(p: index.Part) -> string { p.blob }), ["p1b", "p2"]);
+    assert_eq(index.ask_complete(ix, "u1", obj("b", "big", "whole")), Result.Ok(["p1b", "p2"]));
+    assert(index.ask_upload(ix, "u1").is_none());
+    assert_eq(index.ask_head(ix, "b", "big").unwrap().blob, "whole");
+    assert_eq(index.ask_abort(ix, "u1"), Result.Err("NoSuchUpload"));
+    index.stop(ix);
+    fs.remove_all(root);
+}
+
+@test
+fn orphans_are_swept_at_start() {
+    let (root, ix) = fresh();
+    index.ask_create_bucket(ix, "b", 1);
+    let kept = blobs.write(root, "kept".to_bytes()).unwrap();
+    let orphan = blobs.write(root, "orphan".to_bytes()).unwrap();
+    index.ask_put(ix, obj("b", "k", kept.id));
+    fs.write_file("${root}/tmp/half-written", "x");
+    index.stop(ix);
+    let ix2 = index.start(root).unwrap();
+    assert(fs.exists(blobs.path(root, kept.id)));
+    assert(!fs.exists(blobs.path(root, orphan.id)));
+    assert(!fs.exists("${root}/tmp/half-written"));
+    index.stop(ix2);
+    fs.remove_all(root);
+}
+
+@test
+fn past_prefix_is_the_next_string() {
+    assert_eq(index.past_prefix("docs/"), "docs0");
+    assert("docs/zzz" < index.past_prefix("docs/"));
+    assert("docs/\u{10FFFE}" < index.past_prefix("docs/"));
+}

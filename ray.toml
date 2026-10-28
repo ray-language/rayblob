@@ -1,0 +1,9 @@
+[package]
+name = "rayblob"
+version = "0.1.0"
+license = "Apache-2.0"
+raylang = "1.27.85"
+
+[dependencies]
+net = "^0.12.0"
+db = "^0.6.0"

@@ -1,0 +1,51 @@
+//! The HTTP server: the index fiber plus `net/webserver`, one fiber per connection.
+
+import std/net;
+import net/webserver;
+import config;
+import index;
+import s3;
+
+pub struct Running {
+    ix: Channel<index.Msg>,
+    port: int,
+}
+
+pub fn listen(cfg: config.Config) -> Result<int, string> {
+    net.tcp_listen(cfg.host, cfg.port)
+}
+
+/// The server's limits: a body as large as the biggest object (plus the framing of an
+/// aws-chunked upload), and time to receive it.
+pub fn limits(cfg: config.Config) -> webserver.Limits {
+    var l = webserver.default_limits();
+    l.max_body_bytes = cfg.max_object + cfg.max_object / 64 + 65536;
+    l.read_timeout_millis = 300000;
+    l
+}
+
+/// Serves on `listener` until SIGTERM/SIGINT, or until `stop` fires when `has_stop`.
+pub fn serve(
+    cfg: config.Config,
+    listener: int,
+    stop: Channel<int>,
+    has_stop: bool
+) -> Result<int, string> {
+    let ix = index.start(cfg.data)?;
+    let ctx = s3.Ctx { cfg: cfg, ix: ix };
+    var opts = webserver.options();
+    opts.limits = limits(cfg);
+    opts.drain_ms = 5000;
+    opts.stop = stop;
+    opts.has_stop = has_stop;
+    opts.no_stdout = true;
+    let r = webserver.serve_options_on(
+        listener,
+        opts,
+        fn() -> fn(webserver.Request) -> webserver.Response {
+            fn(req: webserver.Request) -> webserver.Response { s3.handle(ctx, req) }
+        }
+    );
+    index.stop(ix);
+    r
+}

@@ -1,0 +1,12 @@
+# dependencies downloaded by the package manager
+.ray-deps/
+# the web packages of dependencies, linked by ray for the editor
+/node_modules/
+# the device link of `ray dev --device` (port + token)
+.ray-dev
+
+# the native binary (make build)
+/rayblob
+# local configuration (has secrets) and data
+/rayblob.toml
+/data/
