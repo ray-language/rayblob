@@ -167,13 +167,12 @@ fn example_signing() -> s3.Signing {
 @test
 fn signed_chunks() {
     let good = chunked_body("ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648");
-    // `.ok()` first: unwrap() on a Result with a struct error does not build natively (finding).
-    let body = s3.dechunk(good, Option.Some(example_signing())).ok().unwrap();
+    let body = s3.dechunk(good, Option.Some(example_signing())).unwrap();
     assert_eq(body.len(), 66560);
     let bad = chunked_body("ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288649");
     assert(s3.dechunk(bad, Option.Some(example_signing())).is_err());
     // Unsigned with a trailer: the sizes alone.
     let unsigned = "5\r\nhello\r\n6\r\n world\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n".to_bytes();
-    assert_eq(from_utf8(s3.dechunk(unsigned, Option.None).ok().unwrap()).unwrap(), "hello world");
+    assert_eq(from_utf8(s3.dechunk(unsigned, Option.None).unwrap()).unwrap(), "hello world");
     assert(s3.dechunk("5\r\nhel".to_bytes(), Option.None).is_err());
 }

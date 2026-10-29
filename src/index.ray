@@ -141,15 +141,12 @@ pub fn start(root: string) -> Result<Channel<Msg>, string> {
     spawn(fn() {
         match (sqlite.connect("${root}/index.db")) {
             Result.Ok(conn) => {
-                // Annotated: a bare `Result.Ok(0)` in send() does not build natively (finding).
-                let up: Result<int, string> = Result.Ok(0);
-                send(ready, up);
+                send(ready, Result.Ok(0));
                 serve(conn, inbox);
                 sqlite.disconnect(conn);
             },
             Result.Err(e) => {
-                let down: Result<int, string> = Result.Err(e);
-                send(ready, down);
+                send(ready, Result.Err(e));
             },
         }
     });

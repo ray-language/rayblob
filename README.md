@@ -97,7 +97,7 @@ de 400 MB a 4,5 s; el MD5 incremental de `src/md5.ray` lo dejó en las cifras de
 
 ## Hallazgos de dogfood
 
-En `../findings/open/rayblob-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #280, #281 y #283 arreglados; #282 parcial (md5 ya no copia la entrada, sigue sin API incremental); #284 y #285 siguen.
+En `../findings/open/rayblob-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #280, #281 y #283 arreglados, y sus rodeos quitados; #282 parcial (md5 ya no copia la entrada, sigue sin API incremental); #284 y #285 siguen.
 
 Lo que se encontró con 1.27.85:
 
