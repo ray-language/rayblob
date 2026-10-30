@@ -51,11 +51,13 @@ src/main.ray     la línea de órdenes (serve, presign, keygen)
 src/config.ray   rayblob.toml: dirección, datos, región, claves
 src/server.ray   net/webserver + la fibra del índice
 src/s3.ray       la API: rutas, autenticación, permisos, XML, multipart, copia
-src/sigv4.ray    SigV4 del lado servidor: petición canónica, verificación, prefirmadas
 src/index.ray    el índice en SQLite, dueño de una sola fibra
 src/blobs.ray    los bytes en disco: escribir, sincronizar, renombrar, unir partes
 src/md5.ray      MD5 incremental (el ETag de S3)
 ```
+
+La firma SigV4 del lado servidor (verificar, prefirmar, chunks firmados) es `net/sigv4`, desde
+net 0.14.0.
 
 - **Los bytes y el índice van por separado.** El handler de cada conexión escribe el cuerpo en
   `data/tmp/`, hace `fsync` (`fs.sync_data`) y lo renombra a `data/blobs/<xx>/<id>`; solo entonces
@@ -97,7 +99,7 @@ de 400 MB a 4,5 s; el MD5 incremental de `src/md5.ray` lo dejó en las cifras de
 
 ## Hallazgos de dogfood
 
-En `../findings/open/rayblob-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #280, #281 y #283 arreglados, y sus rodeos quitados; #282 parcial (md5 ya no copia la entrada, sigue sin API incremental); #284 y #285 siguen.
+En `../findings/open/rayblob-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #280, #281 y #283 arreglados, y sus rodeos quitados; #282 parcial (md5 ya no copia la entrada, sigue sin API incremental); #284 sigue; #285 arreglado en net 0.14.0, y rayblob usa ya `net/sigv4` (su `src/sigv4.ray`, ~300 líneas, pasó a `net`).
 
 Lo que se encontró con 1.27.85:
 

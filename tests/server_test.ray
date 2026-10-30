@@ -8,7 +8,7 @@ import std/xml;
 import net/http;
 import config;
 import server;
-import sigv4;
+import net/sigv4;
 
 const ACCESS: string = "AKRBTEST00000001";
 
@@ -77,7 +77,7 @@ fn call_as(
 ) -> http.Response {
     let host = "127.0.0.1:${s.port}";
     let date = sigv4.amz_date(time.now());
-    let sha = sigv4.sha256_hex(body);
+    let sha = sigv4.payload_hash(body);
     let h: Map<string, string> = Map.new();
     h.insert("host", host);
     h.insert("x-amz-date", date);
@@ -234,9 +234,7 @@ fn s3_end_to_end() {
     // Presigned URLs: an upload by a client with no credentials, then a download.
     let host = "127.0.0.1:${s.port}";
     let up = sigv4.presign(
-        ACCESS,
-        SECRET,
-        "us-east-1",
+        sigv4.credentials(ACCESS, SECRET, "us-east-1", "s3"),
         "PUT",
         host,
         "/pics/by-url.txt",
@@ -249,9 +247,7 @@ fn s3_end_to_end() {
         200
     );
     let down = sigv4.presign(
-        ACCESS,
-        SECRET,
-        "us-east-1",
+        sigv4.credentials(ACCESS, SECRET, "us-east-1", "s3"),
         "GET",
         host,
         "/pics/by-url.txt",
@@ -260,9 +256,7 @@ fn s3_end_to_end() {
     );
     assert_eq(body_of(http.fetch("http://${host}${down}").unwrap()), "from a form");
     let old = sigv4.presign(
-        ACCESS,
-        SECRET,
-        "us-east-1",
+        sigv4.credentials(ACCESS, SECRET, "us-east-1", "s3"),
         "GET",
         host,
         "/pics/by-url.txt",

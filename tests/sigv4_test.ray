@@ -2,7 +2,7 @@
 // Header" and "Authenticating Requests: Using Query Parameters"), byte for byte.
 
 import s3;
-import sigv4;
+import net/sigv4;
 
 const ACCESS: string = "AKIAIOSFODNN7EXAMPLE";
 
@@ -55,7 +55,7 @@ fn get_object() {
 
 @test
 fn put_object_with_an_encoded_key() {
-    let body_sha = sigv4.sha256_hex("Welcome to Amazon S3.".to_bytes());
+    let body_sha = sigv4.payload_hash("Welcome to Amazon S3.".to_bytes());
     assert_eq(body_sha, "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072");
     let h = headers(
         [
@@ -100,9 +100,7 @@ fn bucket_subresource_and_list_query() {
 fn presigned_url() {
     let ms = sigv4.parse_amz_date(AT).unwrap();
     let url = sigv4.presign(
-        ACCESS,
-        SECRET,
-        "us-east-1",
+        sigv4.credentials(ACCESS, SECRET, "us-east-1", "s3"),
         "GET",
         "examplebucket.s3.amazonaws.com",
         "/test.txt",
@@ -121,7 +119,7 @@ fn header_claim_round_trip() {
     let v = "AWS4-HMAC-SHA256 Credential=${ACCESS}/20130524/us-east-1/s3/aws4_request,"
         + "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
         + "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41";
-    let claim = sigv4.parse_header(v, AT).unwrap();
+    let claim = sigv4.parse_authorization(v, AT).unwrap();
     assert_eq(claim.access_key, ACCESS);
     assert_eq(claim.signed_headers.len(), 4);
     let h = headers(
@@ -142,7 +140,7 @@ fn header_claim_round_trip() {
         sigv4.verify(claim, SECRET, "GET", "/test.txt", "", h, EMPTY_SHA, now + 3600000),
         Result.Err("skewed")
     );
-    assert_eq(sigv4.parse_header("Basic abc", AT).is_err(), true);
+    assert_eq(sigv4.parse_authorization("Basic abc", AT).is_err(), true);
 }
 
 // The STREAMING-AWS4-HMAC-SHA256-PAYLOAD example: 64 KiB + 1 KiB of 'a', each chunk signed

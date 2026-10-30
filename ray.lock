@@ -3,12 +3,12 @@
 
 [db]
 url = "https://github.com/ray-language/db"
-ref = "v0.7.0"
-commit = "263551b758b5ce4568841628b188688a67ad0c2a"
-hash = "sha256:7e12a3e40dc703cd7bf98838a1cb3d928c230cff3462069016dc550a477d4b48"
+ref = "v0.7.2"
+commit = "91fc8149251d0a135c59856c9e434ec1f730f6b5"
+hash = "sha256:2d8c4e2e730031b0af341cde0cf4c7f8a6454b0a75b52564eedf818bde257c5b"
 
 [net]
 url = "https://github.com/ray-language/net"
-ref = "v0.13.0"
-commit = "45fa63b84a3eefd0a4bcc67b9d37ee5e65f4c9f5"
-hash = "sha256:f75453f79450473fe9834011dc87335e6690b8ee98c426e73fe2e0d49d262aa3"
+ref = "v0.14.0"
+commit = "a7e9c55b6559b6506e65cc1894de3172fce89235"
+hash = "sha256:06d09beadbfdeb6654207fa1c4f22ed36f45ca6e159c848074b3097516614e83"

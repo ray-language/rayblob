@@ -7,7 +7,7 @@ import std/time;
 import std/url;
 import config;
 import server;
-import sigv4;
+import net/sigv4;
 
 const VERSION: string = "0.1.0";
 
@@ -91,9 +91,7 @@ fn presign(argv: [string]) -> Result<int, string> {
     let host = flag(argv, "--host", "${cfg.host}:${cfg.port}");
     let path = "/" + sigv4.encode_path(pos[0]);
     let signed = sigv4.presign(
-        k.access,
-        k.secret,
-        cfg.region,
+        sigv4.credentials(k.access, k.secret, cfg.region, "s3"),
         method,
         host,
         path,
