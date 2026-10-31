@@ -3,10 +3,10 @@
 //! so the index never names a file that is half written. Blobs are immutable: an overwrite
 //! writes a new one and the old one is removed after the index stops naming it.
 
+import std/crypto/md5;
 import std/fs;
 import std/hex;
 import std/uuid;
-import md5;
 
 /// What was written: its id, size, and the hex MD5 that S3 calls the ETag.
 pub struct Written {
@@ -51,16 +51,8 @@ pub fn write(root: string, data: bytes) -> Result<Written, string> {
     Result.Ok(Written { id: id, size: data.len(), md5: digest(data) })
 }
 
-// MD5 a slice at a time (see md5.ray for why not std/crypto/md5).
 fn digest(data: bytes) -> string {
-    let h = md5.new();
-    var pos = 0;
-    while (pos < data.len()) {
-        let end = if (pos + CHUNK > data.len()) { data.len() } else { pos + CHUNK };
-        md5.update(h, data.sub_bytes(pos, end));
-        pos = end;
-    }
-    hex.hex_encode(md5.finish(h))
+    hex.hex_encode(md5.md5(data))
 }
 
 fn write_synced(h: int, data: bytes) -> Result<int, string> {

@@ -2,6 +2,7 @@
 //! nobody), what they ask for, and the XML S3 clients expect back.
 
 import std/base64;
+import std/crypto/md5;
 import std/hex;
 import std/time;
 import std/url;
@@ -11,7 +12,6 @@ import net/webserver;
 import blobs;
 import config;
 import index;
-import md5;
 import net/sigv4;
 
 const NS: string = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -1097,7 +1097,7 @@ fn complete_upload(
     for p in chosen {
         digests.push(hex.hex_decode(p.etag).unwrap_or(bytes_of([])));
     }
-    let etag = md5.hex_of(bytes_concat(digests)) + "-${chosen.len()}";
+    let etag = hex.hex_encode(md5.md5(bytes_concat(digests))) + "-${chosen.len()}";
     let w = match (blobs.concat(ctx.cfg.data, chosen.map(fn(p: index.Part) -> string { p.blob }))) {
         Result.Ok(v) => v,
         Result.Err(e) => return fail("InternalError", "could not join the parts: ${e}"),

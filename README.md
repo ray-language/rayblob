@@ -53,7 +53,6 @@ src/server.ray   net/webserver + la fibra del índice
 src/s3.ray       la API: rutas, autenticación, permisos, XML, multipart, copia
 src/index.ray    el índice en SQLite, dueño de una sola fibra
 src/blobs.ray    los bytes en disco: escribir, sincronizar, renombrar, unir partes
-src/md5.ray      MD5 incremental (el ETag de S3)
 ```
 
 La firma SigV4 del lado servidor (verificar, prefirmar, chunks firmados) es `net/sigv4`, desde
@@ -95,11 +94,12 @@ en la misma máquina:
 
 La memoria de una subida es casi toda del servidor web, que recibe el cuerpo entero (~4,5× su
 tamaño, #284). El primer MD5, el de `std/crypto/md5`, llevaba un PUT de 64 MiB a 1,7 GiB y la subida
-de 400 MB a 4,5 s; el MD5 incremental de `src/md5.ray` lo dejó en las cifras de arriba (#282).
+de 400 MB a 4,5 s; el MD5 incremental de `src/md5.ray` lo dejó en las cifras de arriba (#282). Desde
+raylang 1.27.86, `std/crypto/md5` no copia la entrada y tiene `md5_init`, y rayblob vuelve a usarlo.
 
 ## Hallazgos de dogfood
 
-En `../findings/open/rayblob-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #280, #281 y #283 arreglados, y sus rodeos quitados; #282 parcial (md5 ya no copia la entrada, sigue sin API incremental); #284 sigue; #285 arreglado en net 0.14.0, y rayblob usa ya `net/sigv4` (su `src/sigv4.ray`, ~300 líneas, pasó a `net`).
+En `../findings/open/rayblob-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #280, #281 y #283 arreglados, y sus rodeos quitados; #282 arreglado (md5 ya no copia la entrada y tiene `md5_init`; rayblob quitó su `src/md5.ray`); #284 sigue; #285 arreglado en net 0.14.0, y rayblob usa ya `net/sigv4` (su `src/sigv4.ray`, ~300 líneas, pasó a `net`).
 
 Lo que se encontró con 1.27.85:
 
